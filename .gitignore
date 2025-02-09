@@ -1,0 +1,12 @@
+# Ignore virtual environment folder
+venv/
+
+# Ignore environment variables
+.env
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Other temporary files
+*.swp
