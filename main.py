@@ -32,20 +32,6 @@ class ForexSignalBot:
         self.telegram_bot = Bot(token=telegram_token)
         self.chat_id = telegram_chat_id
         self.pairs = pairs or ['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 'GBP_USD', 'USD_CHF', 'GBP_JPY', 'XAU_USD']
-        self.trading_sessions = {
-            'EUR_USD': {
-                'London': ('07:00', '16:00'),
-                'New_York': ('12:00', '21:00')
-            },
-            'USD_JPY': {
-                'Tokyo': ('23:00', '08:00'),
-                'New_York': ('12:00', '21:00')
-            },
-            'AUD_USD': {
-                'Sydney': ('21:00', '06:00'),
-                'Tokyo': ('23:00', '08:00')
-            },
-        }
 
     async def send_telegram_message(self, message: str) -> None:
         """Send message through Telegram"""
@@ -54,39 +40,6 @@ class ForexSignalBot:
             logger.info("Telegram message sent successfully")
         except Exception as e:
             logger.error(f"Error sending Telegram message: {str(e)}")
-
-    def is_trading_session(self, pair: str, timestamp: datetime) -> bool:
-        """Check if current time is within trading session for the pair"""
-        try:
-            if timestamp.tzinfo is None:
-                timestamp = pytz.utc.localize(timestamp)
-            else:
-                timestamp = timestamp.astimezone(pytz.UTC)
-            
-            hour = timestamp.hour
-            minute = timestamp.minute
-            current_time = hour + minute/60.0
-            
-            sessions = self.trading_sessions.get(pair, {})
-            for session, (start, end) in sessions.items():
-                start_hour, start_minute = map(int, start.split(':'))
-                end_hour, end_minute = map(int, end.split(':'))
-                
-                session_start = start_hour + start_minute/60.0
-                session_end = end_hour + end_minute/60.0
-                
-                if session_end < session_start:
-                    if current_time >= session_start or current_time <= session_end:
-                        return True
-                else:
-                    if session_start <= current_time <= session_end:
-                        return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error checking trading session: {str(e)}")
-            return False
 
     def get_current_data(self, pair: str, count: int = 100, granularity: str = "H1") -> pd.DataFrame:
         """Fetch recent price data from Oanda"""
@@ -181,10 +134,6 @@ Risk/Reward: {risk_reward:.2f}
     async def check_for_signals(self, pair: str) -> None:
         """Check for trading signals and send them through Telegram"""
         try:
-            if not self.is_trading_session(pair, datetime.now(pytz.UTC)):
-                logger.info(f"Pair {pair} is not in an active trading session.")
-                return
-            
             data = self.get_current_data(pair)
             if data.empty:
                 logger.info(f"No data fetched for {pair}.")
@@ -260,10 +209,8 @@ async def check_signals(pair: str = None):
         await asyncio.gather(*tasks)
         return {"message": "Checked signals for all pairs"}
 
-# New startup event
 @app.on_event("startup")
 async def startup_event():
-    # This message will be sent to Telegram when the bot starts
     startup_message = "Forex Signal Bot is now running on Railway!"
     await forex_bot.send_telegram_message(startup_message)
 
@@ -271,4 +218,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
