@@ -260,9 +260,12 @@ async def check_signals(pair: str = None):
         await asyncio.gather(*tasks)
         return {"message": "Checked signals for all pairs"}
 
-@app.get("/")
-async def read_root():
-    return {"message": "Hello, Railway! Your app is running."}
+# New startup event
+@app.on_event("startup")
+async def startup_event():
+    # This message will be sent to Telegram when the bot starts
+    startup_message = "Forex Signal Bot is now running on Railway!"
+    await forex_bot.send_telegram_message(startup_message)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
