@@ -256,4 +256,6 @@ async def check_signals(pair: str = None):
         return {"message": "Checked signals for all pairs"}
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
+    port = int(os.getenv("PORT", 8080))  # Get port from Railway
+    uvicorn.run(app, host="0.0.0.0", port=port)
+    
