@@ -255,7 +255,12 @@ async def check_signals(pair: str = None):
         await asyncio.gather(*tasks)
         return {"message": "Checked signals for all pairs"}
 
+@app.get("/")
+async def read_root():
+    return {"message": "Hello, Railway! Your app is running."}
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8080))  # Get port from Railway
+    port = int(os.environ.get("PORT", 8080))
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
     
