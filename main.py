@@ -10,6 +10,7 @@ import pytz
 from dotenv import load_dotenv
 
 from fastapi import FastAPI
+from fastapi.responses import Response
 import uvicorn
 
 from oandapyV20 import API
@@ -239,6 +240,10 @@ forex_bot = ForexSignalBot(api_key=OANDA_API_KEY,
 @app.get("/")
 async def root():
     return {"message": "Forex Signal Bot is running"}
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 @app.get("/check_signals")
 async def check_signals(pair: str = None):
