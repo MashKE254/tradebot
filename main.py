@@ -1,8 +1,8 @@
 import os
 import logging
 import asyncio
-from datetime import datetime
-from typing import List
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -15,11 +15,15 @@ import uvicorn
 
 from oandapyV20 import API
 from oandapyV20.endpoints import instruments
+from oandapyV20.contrib.factories import InstrumentsCandlesFactory
 from telegram import Bot
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 OANDA_API_KEY = os.getenv("OANDA_API_KEY")
@@ -27,11 +31,21 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 class ForexSignalBot:
-    def __init__(self, api_key: str, telegram_token: str, telegram_chat_id: str, pairs: List[str] = None):
+    def __init__(self, api_key: str, telegram_token: str, telegram_chat_id: str, 
+                 pairs: List[str] = None, higher_timeframe: str = "H4", lower_timeframe: str = "M30"):
         self.client = API(access_token=api_key)
         self.telegram_bot = Bot(token=telegram_token)
         self.chat_id = telegram_chat_id
-        self.pairs = pairs or ['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 'GBP_USD', 'USD_CHF', 'GBP_JPY', 'XAU_USD']
+        self.pairs = pairs or ['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 
+                              'GBP_USD', 'GBP_JPY', 'XAU_USD', 'EUR_JPY', 
+                              'AUD_JPY', 'USD_CHF', 'NZD_USD', 'EUR_GBP', 
+                              'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD']
+        
+        # Timeframe settings from backtesting strategy
+        self.higher_timeframe = higher_timeframe
+        self.lower_timeframe = lower_timeframe
+        self.fixed_risk_amount = 100 
+        self.min_risk_reward = 2.0
 
     async def send_telegram_message(self, message: str) -> None:
         """Send message through Telegram"""
@@ -41,7 +55,7 @@ class ForexSignalBot:
         except Exception as e:
             logger.error(f"Error sending Telegram message: {str(e)}")
 
-    def get_current_data(self, pair: str, count: int = 100, granularity: str = "H1") -> pd.DataFrame:
+    def get_current_data(self, pair: str, granularity: str, count: int = 500) -> pd.DataFrame:
         """Fetch recent price data from Oanda"""
         try:
             params = {
@@ -49,11 +63,13 @@ class ForexSignalBot:
                 "granularity": granularity
             }
             
-            request = instruments.InstrumentsCandles(instrument=pair, params=params)
-            response = self.client.request(request)
+            candles_list = []
+            for r in InstrumentsCandlesFactory(instrument=pair, params=params):
+                rv = self.client.request(r)
+                candles_list.extend(rv["candles"])
             
             prices = []
-            for candle in response['candles']:
+            for candle in candles_list:
                 if candle['complete']:
                     prices.append({
                         'time': pd.to_datetime(candle['time']),
@@ -66,27 +82,71 @@ class ForexSignalBot:
             df = pd.DataFrame(prices)
             if not df.empty:
                 df.set_index('time', inplace=True)
+                df.sort_index(inplace=True)
             return df
             
         except Exception as e:
             logger.error(f"Error fetching data for {pair}: {str(e)}")
             return pd.DataFrame()
 
-    def calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators"""
+    def calculate_indicators(self, data: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """Calculate technical indicators with timeframe-optimized parameters"""
         try:
             df = data.copy()
+            
+            # Trend Indicators
             df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
             df['EMA200'] = df['close'].ewm(span=200, adjust=False).mean()
-            
-            exp1 = df['close'].ewm(span=12, adjust=False).mean()
-            exp2 = df['close'].ewm(span=26, adjust=False).mean()
+
+            # MACD Calculation with Timeframe-Specific Parameters
+            if timeframe == "M30":
+                fast_period = 8
+                slow_period = 17
+                signal_period = 6
+            else:
+                fast_period = 12
+                slow_period = 26
+                signal_period = 9
+
+            exp1 = df['close'].ewm(span=fast_period, adjust=False).mean()
+            exp2 = df['close'].ewm(span=slow_period, adjust=False).mean()
             df['MACD'] = exp1 - exp2
-            df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+            df['Signal'] = df['MACD'].ewm(span=signal_period, adjust=False).mean()
             df['MACD_Hist'] = df['MACD'] - df['Signal']
+
+            # RSI
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).fillna(0)
+            loss = (-delta.where(delta < 0, 0)).fillna(0)
             
-            return df
+            avg_gain = gain.rolling(window=14, min_periods=1).mean()
+            avg_loss = loss.rolling(window=14, min_periods=1).mean()
+            rs = avg_gain / avg_loss
+            df['RSI'] = 100 - (100 / (1 + rs))
+
+            # ADX
+            high = df['high']
+            low = df['low']
+            close = df['close']
             
+            plus_dm = high.diff()
+            minus_dm = low.diff().abs()
+            plus_dm[plus_dm < 0] = 0
+            minus_dm[minus_dm < 0] = 0
+            
+            tr1 = high - low
+            tr2 = (high - close.shift()).abs()
+            tr3 = (low - close.shift()).abs()
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            
+            atr = tr.rolling(14).mean()
+            plus_di = 100 * (plus_dm.rolling(14).mean() / atr)
+            minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
+            dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+            df['ADX'] = dx.rolling(14).mean()
+
+            return df.ffill().dropna()
+
         except Exception as e:
             logger.error(f"Error calculating indicators: {str(e)}")
             return data
@@ -117,6 +177,7 @@ class ForexSignalBot:
                             stop_loss: float, take_profit: float) -> str:
         """Format the signal message for Telegram"""
         risk_reward = abs(take_profit - entry_price) / abs(stop_loss - entry_price)
+        position_size = self.calculate_position_size(entry_price, stop_loss)
         
         message = f"""
 🔔 <b>New {pair} Signal</b>
@@ -126,65 +187,99 @@ Entry Price: {entry_price:.5f}
 Stop Loss: {stop_loss:.5f}
 Take Profit: {take_profit:.5f}
 Risk/Reward: {risk_reward:.2f}
+Position Size: {position_size:.2f} units
 
-⚠️ <i>Always manage your risk and do your own analysis</i>
+⚠️ <i>Fixed risk: ${self.fixed_risk_amount} per trade</i>
 """
         return message
 
     async def check_for_signals(self, pair: str) -> None:
-        """Check for trading signals and send them through Telegram"""
+        """Check for trading signals using the backtest strategy"""
         try:
-            data = self.get_current_data(pair)
-            if data.empty:
-                logger.info(f"No data fetched for {pair}.")
-                return
+            # Get data for both timeframes
+            data_lower = self.get_current_data(pair, self.lower_timeframe, 500)
+            data_higher = self.get_current_data(pair, self.higher_timeframe, 500)
             
-            data = self.calculate_indicators(data)
+            if data_lower.empty or data_higher.empty:
+                return
+
+            # Calculate indicators
+            data_lower = self.calculate_indicators(data_lower, self.lower_timeframe)
+            data_higher = self.calculate_indicators(data_higher, self.higher_timeframe)
+            
+            # Merge higher timeframe data
+            h_tf_ema50 = f"{self.higher_timeframe}_EMA50"
+            h_tf_ema200 = f"{self.higher_timeframe}_EMA200"
+            data_lower[h_tf_ema50] = np.nan
+            data_lower[h_tf_ema200] = np.nan
+            
+            for idx in data_lower.index:
+                matching_higher_idx = data_higher.index.asof(idx)
+                if not pd.isna(matching_higher_idx):
+                    data_lower.at[idx, h_tf_ema50] = data_higher.at[matching_higher_idx, 'EMA50']
+                    data_lower.at[idx, h_tf_ema200] = data_higher.at[matching_higher_idx, 'EMA200']
+            
+            data = data_lower.ffill().dropna()
             data = self.find_swing_points(data)
             
             current_bar = data.iloc[-1]
             prev_bar = data.iloc[-2]
-            
+
+            # Long Signal Conditions
             if (current_bar['EMA50'] > current_bar['EMA200'] and
+                current_bar[h_tf_ema50] > current_bar[h_tf_ema200] and
                 current_bar['MACD_Hist'] > 0 and
                 prev_bar['MACD_Hist'] <= 0 and
-                current_bar['MACD'] < 0):
-                
+                current_bar['MACD'] < 0 and
+                current_bar['RSI'] < 65 and
+                current_bar['ADX'] > 25):
+
                 recent_lows = data['SwingLow'].iloc[-20:].dropna()
-                if not recent_lows.empty:
-                    stop_loss = recent_lows.iloc[-1]
-                    entry_price = current_bar['close']
-                    risk = entry_price - stop_loss
-                    take_profit = entry_price + (risk * 2.5)
-                    
+                if recent_lows.empty:
+                    return
+                
+                stop_loss = recent_lows.iloc[-1]
+                entry_price = current_bar['close']
+                risk = entry_price - stop_loss
+                take_profit = entry_price + (risk * 2)
+                
+                if (take_profit - entry_price) / risk >= 2:
                     message = self.format_signal_message(pair, "LONG", entry_price, stop_loss, take_profit)
                     await self.send_telegram_message(message)
-                    logger.info(f"Buy signal generated for {pair}")
-            
+
+            # Short Signal Conditions
             elif (current_bar['EMA50'] < current_bar['EMA200'] and
+                  current_bar[h_tf_ema50] < current_bar[h_tf_ema200] and
                   current_bar['MACD_Hist'] < 0 and
                   prev_bar['MACD_Hist'] >= 0 and
-                  current_bar['MACD'] > 0):
-                
+                  current_bar['MACD'] > 0 and
+                  current_bar['RSI'] > 35 and
+                  current_bar['ADX'] > 25):
+
                 recent_highs = data['SwingHigh'].iloc[-20:].dropna()
-                if not recent_highs.empty:
-                    stop_loss = recent_highs.iloc[-1]
-                    entry_price = current_bar['close']
-                    risk = stop_loss - entry_price
-                    take_profit = entry_price - (risk * 2.5)
-                    
+                if recent_highs.empty:
+                    return
+                
+                stop_loss = recent_highs.iloc[-1]
+                entry_price = current_bar['close']
+                risk = stop_loss - entry_price
+                take_profit = entry_price - (risk * 2)
+                
+                if (entry_price - take_profit) / risk >= 2:
                     message = self.format_signal_message(pair, "SHORT", entry_price, stop_loss, take_profit)
                     await self.send_telegram_message(message)
-                    logger.info(f"Sell signal generated for {pair}")
-                    
+
         except Exception as e:
             logger.error(f"Error checking signals for {pair}: {str(e)}")
 
+
 app = FastAPI()
 
-forex_bot = ForexSignalBot(api_key=OANDA_API_KEY,
-                           telegram_token=TELEGRAM_TOKEN,
-                           telegram_chat_id=TELEGRAM_CHAT_ID)
+forex_bot = ForexSignalBot(
+    api_key=OANDA_API_KEY,
+    telegram_token=TELEGRAM_TOKEN,
+    telegram_chat_id=TELEGRAM_CHAT_ID
+)
 
 @app.get("/")
 async def root():
@@ -211,10 +306,9 @@ async def check_signals(pair: str = None):
 
 @app.on_event("startup")
 async def startup_event():
-    startup_message = "Forex Signal Bot is now running on Railway!"
+    startup_message = "Advanced Forex Signal Bot (matching backtesting strategy) is now running!"
     await forex_bot.send_telegram_message(startup_message)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=port)
