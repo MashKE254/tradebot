@@ -3,18 +3,14 @@ import logging
 import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-
 import numpy as np
 import pandas as pd
 import pytz
 from dotenv import load_dotenv
-
 from fastapi import FastAPI
 from fastapi.responses import Response
 import uvicorn
-
 from oandapyV20 import API
-from oandapyV20.endpoints import instruments
 from oandapyV20.contrib.factories import InstrumentsCandlesFactory
 from telegram import Bot
 
@@ -26,13 +22,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-OANDA_API_KEY = os.getenv("OANDA_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
 class ForexSignalBot:
-    def __init__(self, api_key: str, telegram_token: str, telegram_chat_id: str, 
-                 pairs: List[str] = None, higher_timeframe: str = "H4", lower_timeframe: str = "M30"):
+    def __init__(self, api_key: str, telegram_token: str, telegram_chat_id: str,
+                 pairs: List[str] = None, higher_timeframe: str = "H4", 
+                 lower_timeframe: str = "M30"):
         self.client = API(access_token=api_key)
         self.telegram_bot = Bot(token=telegram_token)
         self.chat_id = telegram_chat_id
@@ -41,11 +34,17 @@ class ForexSignalBot:
                               'AUD_JPY', 'USD_CHF', 'NZD_USD', 'EUR_GBP', 
                               'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD']
         
-        # Timeframe settings from backtesting strategy
         self.higher_timeframe = higher_timeframe
         self.lower_timeframe = lower_timeframe
-        self.fixed_risk_amount = 100 
-        self.min_risk_reward = 2.0
+        self.fixed_risk_amount = 100
+        self.min_risk_reward = 3.0  # Corrected to backtest value
+        
+        # Risk management parameters
+        self.initial_balance = 10000
+        self.current_balance = self.initial_balance
+        self.daily_start_balance = self.initial_balance
+        self.daily_loss_limit = 0.05  # 5% daily loss limit
+        self.last_check_day = datetime.now(pytz.utc).date()
 
     async def send_telegram_message(self, message: str) -> None:
         """Send message through Telegram"""
@@ -58,12 +57,9 @@ class ForexSignalBot:
     def get_current_data(self, pair: str, granularity: str, count: int = 500) -> pd.DataFrame:
         """Fetch recent price data from Oanda"""
         try:
-            params = {
-                "count": count,
-                "granularity": granularity
-            }
-            
+            params = {"count": count, "granularity": granularity}
             candles_list = []
+            
             for r in InstrumentsCandlesFactory(instrument=pair, params=params):
                 rv = self.client.request(r)
                 candles_list.extend(rv["candles"])
@@ -98,15 +94,10 @@ class ForexSignalBot:
             df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
             df['EMA200'] = df['close'].ewm(span=200, adjust=False).mean()
 
-            # MACD Calculation with Timeframe-Specific Parameters
-            if timeframe == "M30":
-                fast_period = 8
-                slow_period = 17
-                signal_period = 6
-            else:
-                fast_period = 12
-                slow_period = 26
-                signal_period = 9
+            # MACD Calculation
+            fast_period = 8 if timeframe == "M30" else 12
+            slow_period = 17 if timeframe == "M30" else 26
+            signal_period = 6 if timeframe == "M30" else 9
 
             exp1 = df['close'].ewm(span=fast_period, adjust=False).mean()
             exp2 = df['close'].ewm(span=slow_period, adjust=False).mean()
@@ -124,10 +115,8 @@ class ForexSignalBot:
             rs = avg_gain / avg_loss
             df['RSI'] = 100 - (100 / (1 + rs))
 
-            # ADX
-            high = df['high']
-            low = df['low']
-            close = df['close']
+            # ADX with +DI/-DI
+            high, low, close = df['high'], df['low'], df['close']
             
             plus_dm = high.diff()
             minus_dm = low.diff().abs()
@@ -144,6 +133,11 @@ class ForexSignalBot:
             minus_di = 100 * (minus_dm.rolling(14).mean() / atr)
             dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
             df['ADX'] = dx.rolling(14).mean()
+            df['+DI'] = plus_di
+            df['-DI'] = minus_di
+
+            # ATR
+            df['ATR'] = tr.rolling(14).mean()
 
             return df.ffill().dropna()
 
@@ -173,6 +167,19 @@ class ForexSignalBot:
             logger.error(f"Error finding swing points: {str(e)}")
             return data
 
+    def check_daily_loss_limit(self) -> bool:
+        """Check if daily loss limit has been reached"""
+        current_day = datetime.now(pytz.utc).date()
+        if current_day != self.last_check_day:
+            self.last_check_day = current_day
+            self.daily_start_balance = self.current_balance
+        
+        daily_pnl = self.current_balance - self.daily_start_balance
+        if daily_pnl <= -self.daily_start_balance * self.daily_loss_limit:
+            logger.warning(f"Daily loss limit reached ({daily_pnl:.2f})")
+            return True
+        return False
+
     def format_signal_message(self, pair: str, signal_type: str, entry_price: float, 
                             stop_loss: float, take_profit: float) -> str:
         """Format the signal message for Telegram"""
@@ -193,12 +200,20 @@ Position Size: {position_size:.2f} units
 """
         return message
 
+    def calculate_position_size(self, entry_price: float, stop_loss: float) -> float:
+        """Calculate position size based on fixed risk amount"""
+        risk_per_unit = abs(entry_price - stop_loss)
+        return self.fixed_risk_amount / risk_per_unit if risk_per_unit != 0 else 0
+
     async def check_for_signals(self, pair: str) -> None:
         """Check for trading signals using the backtest strategy"""
         try:
+            if self.check_daily_loss_limit():
+                return
+
             # Get data for both timeframes
-            data_lower = self.get_current_data(pair, self.lower_timeframe, 500)
-            data_higher = self.get_current_data(pair, self.higher_timeframe, 500)
+            data_lower = self.get_current_data(pair, self.lower_timeframe)
+            data_higher = self.get_current_data(pair, self.higher_timeframe)
             
             if data_lower.empty or data_higher.empty:
                 return
@@ -241,11 +256,11 @@ Position Size: {position_size:.2f} units
                 stop_loss = recent_lows.iloc[-1]
                 entry_price = current_bar['close']
                 risk = entry_price - stop_loss
-                take_profit = entry_price + (risk * 2)
+                take_profit = entry_price + (risk * 3)  # 3:1 RR
                 
-                if (take_profit - entry_price) / risk >= 2:
-                    message = self.format_signal_message(pair, "LONG", entry_price, stop_loss, take_profit)
-                    await self.send_telegram_message(message)
+                message = self.format_signal_message(pair, "LONG", entry_price, stop_loss, take_profit)
+                await self.send_telegram_message(message)
+                self.current_balance -= self.fixed_risk_amount  # Simulate risk
 
             # Short Signal Conditions
             elif (current_bar['EMA50'] < current_bar['EMA200'] and
@@ -263,39 +278,25 @@ Position Size: {position_size:.2f} units
                 stop_loss = recent_highs.iloc[-1]
                 entry_price = current_bar['close']
                 risk = stop_loss - entry_price
-                take_profit = entry_price - (risk * 2)
+                take_profit = entry_price - (risk * 3)  # 3:1 RR
                 
-                if (entry_price - take_profit) / risk >= 2:
-                    message = self.format_signal_message(pair, "SHORT", entry_price, stop_loss, take_profit)
-                    await self.send_telegram_message(message)
+                message = self.format_signal_message(pair, "SHORT", entry_price, stop_loss, take_profit)
+                await self.send_telegram_message(message)
+                self.current_balance -= self.fixed_risk_amount  # Simulate risk
 
         except Exception as e:
             logger.error(f"Error checking signals for {pair}: {str(e)}")
 
-
 app = FastAPI()
-
 forex_bot = ForexSignalBot(
-    api_key=OANDA_API_KEY,
-    telegram_token=TELEGRAM_TOKEN,
-    telegram_chat_id=TELEGRAM_CHAT_ID
+    api_key=os.getenv("OANDA_API_KEY"),
+    telegram_token=os.getenv("TELEGRAM_TOKEN"),
+    telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID")
 )
-
-@app.get("/")
-async def root():
-    return {"message": "Forex Signal Bot is running"}
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return Response(status_code=204)
 
 @app.get("/check_signals")
 async def check_signals(pair: str = None):
-    """
-    Endpoint to check for signals.
-    If a specific pair is provided via query parameter, check that pair;
-    otherwise, check all pairs concurrently.
-    """
+    """Endpoint to check for signals"""
     if pair:
         await forex_bot.check_for_signals(pair)
         return {"message": f"Checked signals for {pair}"}
@@ -306,7 +307,7 @@ async def check_signals(pair: str = None):
 
 @app.on_event("startup")
 async def startup_event():
-    startup_message = "Advanced Forex Signal Bot (matching backtesting strategy) is now running!"
+    startup_message = "Forex Signal Bot (Aligned with Backtest) is now running!"
     await forex_bot.send_telegram_message(startup_message)
 
 if __name__ == "__main__":
