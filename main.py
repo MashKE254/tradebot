@@ -311,5 +311,5 @@ async def startup_event():
     await forex_bot.send_telegram_message(startup_message)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Run the FastAPI app with uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
