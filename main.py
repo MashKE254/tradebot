@@ -37,7 +37,7 @@ class ForexSignalBot:
         self.higher_timeframe = higher_timeframe
         self.lower_timeframe = lower_timeframe
         self.fixed_risk_amount = 100
-        self.min_risk_reward = 3.0  # Corrected to backtest value
+        self.min_risk_reward = 1.75  # Corrected to backtest value
         
         # Risk management parameters
         self.initial_balance = 10000
@@ -294,6 +294,10 @@ forex_bot = ForexSignalBot(
     telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID")
 )
 
+@app.get("/")
+async def root():
+    return {"message": "Forex Signal Bot is running"}
+
 @app.get("/check_signals")
 async def check_signals(pair: str = None):
     """Endpoint to check for signals"""
@@ -305,10 +309,6 @@ async def check_signals(pair: str = None):
         await asyncio.gather(*tasks)
         return {"message": "Checked signals for all pairs"}
 
-@app.on_event("startup")
-async def startup_event():
-    startup_message = "Forex Signal Bot (Aligned with Backtest) is now running!"
-    await forex_bot.send_telegram_message(startup_message)
 
 if __name__ == "__main__":
     # Run the FastAPI app with uvicorn
