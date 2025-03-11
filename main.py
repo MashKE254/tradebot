@@ -13,6 +13,8 @@ import uvicorn
 from oandapyV20 import API
 from oandapyV20.contrib.factories import InstrumentsCandlesFactory
 from telegram import Bot
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 load_dotenv()
 
@@ -37,25 +39,32 @@ class ForexSignalBot:
         self.higher_timeframe = higher_timeframe
         self.lower_timeframe = lower_timeframe
         self.fixed_risk_amount = 100
-        self.min_risk_reward = 1.75  # Corrected to backtest value
+        self.min_risk_reward = 1.75
         
-        # Risk management parameters
+        # Risk management
         self.initial_balance = 10000
         self.current_balance = self.initial_balance
         self.daily_start_balance = self.initial_balance
-        self.daily_loss_limit = 0.05  # 5% daily loss limit
+        self.daily_loss_limit = 0.05
         self.last_check_day = datetime.now(pytz.utc).date()
+        
+        # Candle alignment tracking
+        self.last_checked = {}
+        self.scheduled_checks = asyncio.Lock()
+        self.active_positions = {}
 
     async def send_telegram_message(self, message: str) -> None:
-        """Send message through Telegram"""
         try:
-            await self.telegram_bot.send_message(chat_id=self.chat_id, text=message, parse_mode='HTML')
-            logger.info("Telegram message sent successfully")
+            await self.telegram_bot.send_message(
+                chat_id=self.chat_id, 
+                text=message, 
+                parse_mode='HTML'
+            )
+            logger.info("Telegram message sent")
         except Exception as e:
-            logger.error(f"Error sending Telegram message: {str(e)}")
+            logger.error(f"Telegram error: {str(e)}")
 
     def get_current_data(self, pair: str, granularity: str, count: int = 500) -> pd.DataFrame:
-        """Fetch recent price data from Oanda"""
         try:
             params = {"count": count, "granularity": granularity}
             candles_list = []
@@ -82,11 +91,10 @@ class ForexSignalBot:
             return df
             
         except Exception as e:
-            logger.error(f"Error fetching data for {pair}: {str(e)}")
+            logger.error(f"Data error {pair}: {str(e)}")
             return pd.DataFrame()
 
     def calculate_indicators(self, data: pd.DataFrame, timeframe: str) -> pd.DataFrame:
-        """Calculate technical indicators with timeframe-optimized parameters"""
         try:
             df = data.copy()
             
@@ -142,11 +150,10 @@ class ForexSignalBot:
             return df.ffill().dropna()
 
         except Exception as e:
-            logger.error(f"Error calculating indicators: {str(e)}")
+            logger.error(f"Indicator error: {str(e)}")
             return data
 
     def find_swing_points(self, data: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
-        """Identify swing high and low points"""
         try:
             df = data.copy()
             df['SwingHigh'] = np.nan
@@ -164,11 +171,10 @@ class ForexSignalBot:
             return df
         
         except Exception as e:
-            logger.error(f"Error finding swing points: {str(e)}")
+            logger.error(f"Swing point error: {str(e)}")
             return data
 
     def check_daily_loss_limit(self) -> bool:
-        """Check if daily loss limit has been reached"""
         current_day = datetime.now(pytz.utc).date()
         if current_day != self.last_check_day:
             self.last_check_day = current_day
@@ -182,11 +188,10 @@ class ForexSignalBot:
 
     def format_signal_message(self, pair: str, signal_type: str, entry_price: float, 
                             stop_loss: float, take_profit: float) -> str:
-        """Format the signal message for Telegram"""
         risk_reward = abs(take_profit - entry_price) / abs(stop_loss - entry_price)
         position_size = self.calculate_position_size(entry_price, stop_loss)
         
-        message = f"""
+        return f"""
 🔔 <b>New {pair} Signal</b>
 
 Type: {'🟢 BUY' if signal_type == 'LONG' else '🔴 SELL'}
@@ -198,95 +203,146 @@ Position Size: {position_size:.2f} units
 
 ⚠️ <i>Fixed risk: ${self.fixed_risk_amount} per trade</i>
 """
-        return message
 
     def calculate_position_size(self, entry_price: float, stop_loss: float) -> float:
-        """Calculate position size based on fixed risk amount"""
         risk_per_unit = abs(entry_price - stop_loss)
         return self.fixed_risk_amount / risk_per_unit if risk_per_unit != 0 else 0
 
     async def check_for_signals(self, pair: str) -> None:
-        """Check for trading signals using the backtest strategy"""
         try:
-            if self.check_daily_loss_limit():
-                return
-
-            # Get data for both timeframes
-            data_lower = self.get_current_data(pair, self.lower_timeframe)
-            data_higher = self.get_current_data(pair, self.higher_timeframe)
-            
-            if data_lower.empty or data_higher.empty:
-                return
-
-            # Calculate indicators
-            data_lower = self.calculate_indicators(data_lower, self.lower_timeframe)
-            data_higher = self.calculate_indicators(data_higher, self.higher_timeframe)
-            
-            # Merge higher timeframe data
-            h_tf_ema50 = f"{self.higher_timeframe}_EMA50"
-            h_tf_ema200 = f"{self.higher_timeframe}_EMA200"
-            data_lower[h_tf_ema50] = np.nan
-            data_lower[h_tf_ema200] = np.nan
-            
-            for idx in data_lower.index:
-                matching_higher_idx = data_higher.index.asof(idx)
-                if not pd.isna(matching_higher_idx):
-                    data_lower.at[idx, h_tf_ema50] = data_higher.at[matching_higher_idx, 'EMA50']
-                    data_lower.at[idx, h_tf_ema200] = data_higher.at[matching_higher_idx, 'EMA200']
-            
-            data = data_lower.ffill().dropna()
-            data = self.find_swing_points(data)
-            
-            current_bar = data.iloc[-1]
-            prev_bar = data.iloc[-2]
-
-            # Long Signal Conditions
-            if (current_bar['EMA50'] > current_bar['EMA200'] and
-                current_bar[h_tf_ema50] > current_bar[h_tf_ema200] and
-                current_bar['MACD_Hist'] > 0 and
-                prev_bar['MACD_Hist'] <= 0 and
-                current_bar['MACD'] < 0 and
-                current_bar['RSI'] < 65 and
-                current_bar['ADX'] > 25):
-
-                recent_lows = data['SwingLow'].iloc[-20:].dropna()
-                if recent_lows.empty:
+            # Candle alignment check
+            now = datetime.now(pytz.utc)
+            if self.lower_timeframe == "M30":
+                if now.minute % 30 != 0 or now.second > 10:
                     return
-                
-                stop_loss = recent_lows.iloc[-1]
-                entry_price = current_bar['close']
-                risk = entry_price - stop_loss
-                take_profit = entry_price + (risk * 3)  # 3:1 RR
-                
-                message = self.format_signal_message(pair, "LONG", entry_price, stop_loss, take_profit)
-                await self.send_telegram_message(message)
-                self.current_balance -= self.fixed_risk_amount  # Simulate risk
-
-            # Short Signal Conditions
-            elif (current_bar['EMA50'] < current_bar['EMA200'] and
-                  current_bar[h_tf_ema50] < current_bar[h_tf_ema200] and
-                  current_bar['MACD_Hist'] < 0 and
-                  prev_bar['MACD_Hist'] >= 0 and
-                  current_bar['MACD'] > 0 and
-                  current_bar['RSI'] > 35 and
-                  current_bar['ADX'] > 25):
-
-                recent_highs = data['SwingHigh'].iloc[-20:].dropna()
-                if recent_highs.empty:
+            elif self.higher_timeframe == "H4":
+                if now.hour % 4 != 0 or now.minute > 1:
                     return
+
+            # Rate limiting
+            async with self.scheduled_checks:
+                if pair in self.last_checked:
+                    elapsed = now - self.last_checked[pair]
+                    if elapsed < timedelta(minutes=28):
+                        return
                 
-                stop_loss = recent_highs.iloc[-1]
-                entry_price = current_bar['close']
-                risk = stop_loss - entry_price
-                take_profit = entry_price - (risk * 3)  # 3:1 RR
+                self.last_checked[pair] = now
+
+                if self.check_daily_loss_limit():
+                    return
+
+                data_lower = self.get_current_data(pair, self.lower_timeframe)
+                data_higher = self.get_current_data(pair, self.higher_timeframe)
                 
-                message = self.format_signal_message(pair, "SHORT", entry_price, stop_loss, take_profit)
-                await self.send_telegram_message(message)
-                self.current_balance -= self.fixed_risk_amount  # Simulate risk
+                if data_lower.empty or data_higher.empty:
+                    return
+
+                data_lower = self.calculate_indicators(data_lower, self.lower_timeframe)
+                data_higher = self.calculate_indicators(data_higher, self.higher_timeframe)
+                
+                h_tf_ema50 = f"{self.higher_timeframe}_EMA50"
+                h_tf_ema200 = f"{self.higher_timeframe}_EMA200"
+                data_lower[h_tf_ema50] = np.nan
+                data_lower[h_tf_ema200] = np.nan
+                
+                for idx in data_lower.index:
+                    matching_higher_idx = data_higher.index.asof(idx)
+                    if not pd.isna(matching_higher_idx):
+                        data_lower.at[idx, h_tf_ema50] = data_higher.at[matching_higher_idx, 'EMA50']
+                        data_lower.at[idx, h_tf_ema200] = data_higher.at[matching_higher_idx, 'EMA200']
+                
+                data = data_lower.ffill().dropna()
+                data = self.find_swing_points(data)
+                
+                current_bar = data.iloc[-1]
+                prev_bar = data.iloc[-2]
+
+                # Long Signal
+                if (current_bar['EMA50'] > current_bar['EMA200'] and
+                    current_bar[h_tf_ema50] > current_bar[h_tf_ema200] and
+                    current_bar['MACD_Hist'] > 0 and
+                    prev_bar['MACD_Hist'] <= 0 and
+                    current_bar['MACD'] < 0 and
+                    current_bar['RSI'] < 65 and
+                    current_bar['ADX'] > 25):
+
+                    recent_lows = data['SwingLow'].iloc[-20:].dropna()
+                    if not recent_lows.empty:
+                        stop_loss = recent_lows.iloc[-1]
+                        entry_price = current_bar['close']
+                        risk = entry_price - stop_loss
+                        take_profit = entry_price + (risk * self.min_risk_reward)
+                        
+                        if take_profit > entry_price:
+                            message = self.format_signal_message(pair, "LONG", entry_price, stop_loss, take_profit)
+                            await self.send_telegram_message(message)
+                            
+                            # Track position
+                            self.active_positions[pair] = {
+                                'type': 'LONG',
+                                'entry': entry_price,
+                                'sl': stop_loss,
+                                'tp': take_profit,
+                                'size': self.calculate_position_size(entry_price, stop_loss)
+                            }
+
+                # Short Signal
+                elif (current_bar['EMA50'] < current_bar['EMA200'] and
+                      current_bar[h_tf_ema50] < current_bar[h_tf_ema200] and
+                      current_bar['MACD_Hist'] < 0 and
+                      prev_bar['MACD_Hist'] >= 0 and
+                      current_bar['MACD'] > 0 and
+                      current_bar['RSI'] > 35 and
+                      current_bar['ADX'] > 25):
+
+                    recent_highs = data['SwingHigh'].iloc[-20:].dropna()
+                    if not recent_highs.empty:
+                        stop_loss = recent_highs.iloc[-1]
+                        entry_price = current_bar['close']
+                        risk = stop_loss - entry_price
+                        take_profit = entry_price - (risk * self.min_risk_reward)
+                        
+                        if take_profit < entry_price:
+                            message = self.format_signal_message(pair, "SHORT", entry_price, stop_loss, take_profit)
+                            await self.send_telegram_message(message)
+                            
+                            self.active_positions[pair] = {
+                                'type': 'SHORT',
+                                'entry': entry_price,
+                                'sl': stop_loss,
+                                'tp': take_profit,
+                                'size': self.calculate_position_size(entry_price, stop_loss)
+                            }
+
+                # Check existing positions
+                if pair in self.active_positions:
+                    position = self.active_positions[pair]
+                    current_low = current_bar['low']
+                    current_high = current_bar['high']
+                    
+                    if position['type'] == 'LONG':
+                        if current_low <= position['sl']:
+                            pl = (position['sl'] - position['entry']) * position['size']
+                            self.current_balance += pl
+                            del self.active_positions[pair]
+                        elif current_high >= position['tp']:
+                            pl = (position['tp'] - position['entry']) * position['size']
+                            self.current_balance += pl
+                            del self.active_positions[pair]
+                    
+                    else:  # SHORT
+                        if current_high >= position['sl']:
+                            pl = (position['entry'] - position['sl']) * position['size']
+                            self.current_balance += pl
+                            del self.active_positions[pair]
+                        elif current_low <= position['tp']:
+                            pl = (position['entry'] - position['tp']) * position['size']
+                            self.current_balance += pl
+                            del self.active_positions[pair]
 
         except Exception as e:
-            logger.error(f"Error checking signals for {pair}: {str(e)}")
-
+            logger.error(f"Signal check error {pair}: {str(e)}")
+            
 app = FastAPI()
 forex_bot = ForexSignalBot(
     api_key=os.getenv("OANDA_API_KEY"),
@@ -294,20 +350,54 @@ forex_bot = ForexSignalBot(
     telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID")
 )
 
+@app.on_event("startup")
+async def startup_event():
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    
+    # M30 check at :00 and :30 with 5-second buffer
+    scheduler.add_job(
+        lambda: asyncio.create_task(check_all_signals()),
+        CronTrigger(minute="0,30", second="5"),
+        max_instances=1
+    )
+    
+    # H4 check at 00:00, 04:00, etc.
+    scheduler.add_job(
+        lambda: asyncio.create_task(check_h4_confirmation()),
+        CronTrigger(hour="0,4,8,12,16,20", minute="0", second="10"),
+        max_instances=1
+    )
+    
+    scheduler.start()
+    logger.info("Scheduler started")
+
+async def check_all_signals():
+    """Check all currency pairs"""
+    tasks = [forex_bot.check_for_signals(pair) for pair in forex_bot.pairs]
+    await asyncio.gather(*tasks)
+    logger.info("Completed full signal check at %s", datetime.utcnow())
+
+async def check_h4_confirmation():
+    """Update higher timeframe trends"""
+    logger.info("Updating H4 trend confirmations")
+    # Add H4-specific logic here
+
 @app.get("/")
 async def root():
-    return {"message": "Forex Signal Bot is running"}
+    return {"status": "active", "balance": forex_bot.current_balance}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 @app.get("/check_signals")
-async def check_signals(pair: str = None):
-    """Endpoint to check for signals"""
+async def manual_check(pair: str = None):
+    """Manual trigger endpoint"""
     if pair:
         await forex_bot.check_for_signals(pair)
-        return {"message": f"Checked signals for {pair}"}
     else:
-        tasks = [forex_bot.check_for_signals(p) for p in forex_bot.pairs]
-        await asyncio.gather(*tasks)
-        return {"message": "Checked signals for all pairs"}
+        await check_all_signals()
+    return {"status": "checked"}
 
 
 if __name__ == "__main__":
