@@ -29,7 +29,13 @@ class ForexSignalBot:
     def __init__(self, api_key: str, telegram_token: str, telegram_chat_id: str,
                  pairs: List[str] = None, higher_timeframe: str = "H4", 
                  lower_timeframe: str = "M30"):
-        self.client = API(access_token=api_key)
+        
+        # Update the API initialization with environment and proper headers
+        self.client = API(
+            access_token=api_key, 
+            environment="live",  # Explicitly set to practice or live
+            headers={"Authorization": f"Bearer {api_key}"})
+        
         self.telegram_bot = Bot(token=telegram_token)
         self.chat_id = telegram_chat_id
         self.pairs = pairs or ['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 
@@ -48,6 +54,19 @@ class ForexSignalBot:
         self.daily_start_balance = self.initial_balance
         self.daily_loss_limit = 0.05
         self.last_check_day = datetime.now(pytz.utc).date()
+        
+    def _check_api_connection(self):
+        """Verify API connectivity by fetching test data"""
+        try:
+            logger.info("Checking API connection...")
+            # Test connection by fetching candles for a known pair
+            test_data = self.get_current_data('EUR_USD', 'M1', count=1)
+            if test_data.empty:
+                raise ConnectionError("API returned empty test data")
+            logger.info("API connection successful")
+        except Exception as e:
+            logger.error(f"API connection failed: {str(e)}")
+            raise RuntimeError("Failed to connect to OANDA API") from e
         
         # Candle alignment tracking
         self.last_checked = {}
