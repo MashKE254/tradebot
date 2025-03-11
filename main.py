@@ -15,6 +15,7 @@ from oandapyV20.contrib.factories import InstrumentsCandlesFactory
 from telegram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from functools import partial
 
 load_dotenv()
 
@@ -350,20 +351,32 @@ forex_bot = ForexSignalBot(
     telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID")
 )
 
+# Create a single global scheduler
+scheduler = AsyncIOScheduler(timezone="UTC")
+
+# Create the async functions that will be directly called by the scheduler
+async def check_all_signals_job():
+    """Check all currency pairs"""
+    tasks = [forex_bot.check_for_signals(pair) for pair in forex_bot.pairs]
+    await asyncio.gather(*tasks)
+    logger.info("Completed full signal check at %s", datetime.utcnow())
+
+async def check_h4_confirmation_job():
+    """Update higher timeframe trends"""
+    logger.info("Updating H4 trend confirmations")
+    # Add H4-specific logic here
+
 @app.on_event("startup")
 async def startup_event():
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    
-    # M30 check at :00 and :30 with 5-second buffer
+    # Schedule the async functions directly
     scheduler.add_job(
-        lambda: asyncio.create_task(check_all_signals()),
+        check_all_signals_job,
         CronTrigger(minute="0,30", second="5"),
         max_instances=1
     )
     
-    # H4 check at 00:00, 04:00, etc.
     scheduler.add_job(
-        lambda: asyncio.create_task(check_h4_confirmation()),
+        check_h4_confirmation_job,
         CronTrigger(hour="0,4,8,12,16,20", minute="0", second="10"),
         max_instances=1
     )
@@ -371,16 +384,12 @@ async def startup_event():
     scheduler.start()
     logger.info("Scheduler started")
 
-async def check_all_signals():
-    """Check all currency pairs"""
-    tasks = [forex_bot.check_for_signals(pair) for pair in forex_bot.pairs]
-    await asyncio.gather(*tasks)
-    logger.info("Completed full signal check at %s", datetime.utcnow())
-
-async def check_h4_confirmation():
-    """Update higher timeframe trends"""
-    logger.info("Updating H4 trend confirmations")
-    # Add H4-specific logic here
+@app.on_event("shutdown")
+async def shutdown_event():
+    # Properly shut down the scheduler when the application stops
+    if scheduler.running:
+        scheduler.shutdown()
+        logger.info("Scheduler shutdown")
 
 @app.get("/")
 async def root():
@@ -396,7 +405,7 @@ async def manual_check(pair: str = None):
     if pair:
         await forex_bot.check_for_signals(pair)
     else:
-        await check_all_signals()
+        await check_all_signals_job()
     return {"status": "checked"}
 
 
