@@ -383,6 +383,8 @@ async def startup_event():
     
     scheduler.start()
     logger.info("Scheduler started")
+    
+    await forex_bot.send_telegram_message("🔔 Forex Trading Bot has started running!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
