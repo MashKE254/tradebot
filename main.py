@@ -55,6 +55,9 @@ class ForexSignalBot:
         self.daily_loss_limit = 0.05
         self.last_check_day = datetime.now(pytz.utc).date()
         
+        # Initialize API connection checks and attributes
+        self._check_api_connection()
+        
     def _check_api_connection(self):
         """Verify API connectivity by fetching test data"""
         try:
