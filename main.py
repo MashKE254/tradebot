@@ -12,6 +12,7 @@ from fastapi.responses import Response
 import uvicorn
 from oandapyV20 import API
 from oandapyV20.contrib.factories import InstrumentsCandlesFactory
+import oandapyV20.endpoints.instruments as instruments
 from telegram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -31,9 +32,11 @@ class ForexSignalBot:
                  lower_timeframe: str = "M30"):
         
         # Update the API initialization with environment and proper headers
+        logger.info(f"setting up API-client for environment practice")
+        logger.info(f"applying headers Authorization")
         self.client = API(
             access_token=api_key, 
-            environment="live",  # Explicitly set to practice or live
+            environment="practice",  # Explicitly set to practice or live
             headers={"Authorization": f"Bearer {api_key}"})
         
         self.telegram_bot = Bot(token=telegram_token)
@@ -62,11 +65,29 @@ class ForexSignalBot:
         """Verify API connectivity by fetching test data"""
         try:
             logger.info("Checking API connection...")
-            # Test connection by fetching candles for a known pair
-            test_data = self.get_current_data('EUR_USD', 'M1', count=1)
-            if test_data.empty:
-                raise ConnectionError("API returned empty test data")
-            logger.info("API connection successful")
+            # Test connection by making a direct request instead of using get_current_data
+            
+            params = {
+                "count": 1,
+                "granularity": "M1"
+            }
+            
+            request = instruments.InstrumentsCandles(
+                instrument="EUR_USD",
+                params=params
+            )
+            
+            # The issue is here - InstrumentsCandles doesn't have an endpoint attribute
+            # Instead we should just log that we're making a request
+            logger.info(f"performing request for EUR_USD candles")
+            response = self.client.request(request)
+            
+            # Check if the response contains candles data
+            if "candles" in response and len(response["candles"]) > 0:
+                logger.info("API connection successful")
+            else:
+                raise ConnectionError("API returned empty candles data")
+                
         except Exception as e:
             logger.error(f"API connection failed: {str(e)}")
             raise RuntimeError("Failed to connect to OANDA API") from e
@@ -89,12 +110,20 @@ class ForexSignalBot:
 
     def get_current_data(self, pair: str, granularity: str, count: int = 500) -> pd.DataFrame:
         try:
+            logger.info(f"Fetching {count} {granularity} candles for {pair}")
             params = {"count": count, "granularity": granularity}
             candles_list = []
             
             for r in InstrumentsCandlesFactory(instrument=pair, params=params):
+                logger.info(f"performing request for {pair} candles")
                 rv = self.client.request(r)
                 candles_list.extend(rv["candles"])
+            
+            logger.info(f"Received {len(candles_list)} candles for {pair}")
+            
+            if not candles_list:
+                logger.warning(f"No candles received for {pair}")
+                return pd.DataFrame()
             
             prices = []
             for candle in candles_list:
@@ -107,10 +136,17 @@ class ForexSignalBot:
                         'close': float(candle['mid']['c'])
                     })
             
+            logger.info(f"Processed {len(prices)} complete candles for {pair}")
+            
+            if not prices:
+                logger.warning(f"No complete candles for {pair}")
+                return pd.DataFrame()
+            
             df = pd.DataFrame(prices)
             if not df.empty:
                 df.set_index('time', inplace=True)
                 df.sort_index(inplace=True)
+                
             return df
             
         except Exception as e:
