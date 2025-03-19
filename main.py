@@ -269,22 +269,14 @@ Position Size: {position_size:.2f} units
 
     async def check_for_signals(self, pair: str) -> None:
         try:
-            # Candle alignment check
-            now = datetime.now(pytz.utc)
-            if self.lower_timeframe == "M30":
-                if now.minute % 30 != 0 or now.second > 10:
-                    return
-            elif self.higher_timeframe == "H4":
-                if now.hour % 4 != 0 or now.minute > 1:
-                    return
-
             # Rate limiting
             async with self.scheduled_checks:
                 if pair in self.last_checked:
                     elapsed = now - self.last_checked[pair]
-                    if elapsed < timedelta(minutes=28):
+                    if elapsed < timedelta(minutes=5):
                         return
                 
+                now = datetime.now(pytz.utc)
                 self.last_checked[pair] = now
 
                 if self.check_daily_loss_limit():
@@ -299,10 +291,15 @@ Position Size: {position_size:.2f} units
                 data_lower = self.calculate_indicators(data_lower, self.lower_timeframe)
                 data_higher = self.calculate_indicators(data_higher, self.higher_timeframe)
                 
+                # Add validation
+                if data_higher['EMA200'].isna().any():
+                    logger.error(f"Insufficient H4 data for {pair}")
+                    return
+                
                 h_tf_ema50 = f"{self.higher_timeframe}_EMA50"
                 h_tf_ema200 = f"{self.higher_timeframe}_EMA200"
-                data_lower[h_tf_ema50] = np.nan
-                data_lower[h_tf_ema200] = np.nan
+  
+  
                 
                 for idx in data_lower.index:
                     matching_higher_idx = data_higher.index.asof(idx)
@@ -315,6 +312,16 @@ Position Size: {position_size:.2f} units
                 
                 current_bar = data.iloc[-1]
                 prev_bar = data.iloc[-2]
+                
+                debug_info = f"""
+        {pair} Signal Check:
+        EMA50 > EMA200: {current_bar['EMA50'] > current_bar['EMA200']}
+        HTF EMA50 > HTF EMA200: {current_bar[h_tf_ema50] > current_bar[h_tf_ema200]}
+        MACD Hist > 0: {current_bar['MACD_Hist'] > 0}
+        ADX > 25: {current_bar['ADX'] > 25}
+        RSI: {current_bar['RSI']}
+        """
+                logger.debug(debug_info)
 
                 # Long Signal
                 if (current_bar['EMA50'] > current_bar['EMA200'] and
