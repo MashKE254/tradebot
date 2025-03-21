@@ -271,12 +271,13 @@ Position Size: {position_size:.2f} units
         try:
             # Rate limiting
             async with self.scheduled_checks:
+                now = datetime.now(pytz.utc)
                 if pair in self.last_checked:
                     elapsed = now - self.last_checked[pair]
                     if elapsed < timedelta(minutes=5):
                         return
                 
-                now = datetime.now(pytz.utc)
+                
                 self.last_checked[pair] = now
 
                 if self.check_daily_loss_limit():
@@ -433,23 +434,32 @@ async def check_h4_confirmation_job():
 
 @app.on_event("startup")
 async def startup_event():
-    # Schedule the async functions directly
+    # Configure scheduler with explicit job store and executor
+    job_defaults = {
+        'misfire_grace_time': 300,
+        'coalesce': True,
+        'max_instances': 1
+    }
+    
+    scheduler = AsyncIOScheduler(
+        job_defaults=job_defaults,
+        timezone="UTC"
+    )
+
     scheduler.add_job(
         check_all_signals_job,
         CronTrigger(minute="0,30", second="5"),
-        max_instances=1
+        name="30m_signals_check"
     )
     
     scheduler.add_job(
         check_h4_confirmation_job,
         CronTrigger(hour="0,4,8,12,16,20", minute="0", second="10"),
-        max_instances=1
+        name="4h_trend_update"
     )
     
     scheduler.start()
-    logger.info("Scheduler started")
-    
-    await forex_bot.send_telegram_message("🔔 Forex Trading Bot has started running!")
+    logger.info("Scheduler started with jobs: %s", scheduler.get_jobs())
 
 @app.on_event("shutdown")
 async def shutdown_event():
