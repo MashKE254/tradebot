@@ -38,6 +38,14 @@ class ForexLiveTradeBot:
         )
         self.logger = logging.getLogger(__name__)
 
+        # Trading Pairs - MOVED THIS BEFORE TELEGRAM INITIALIZATION
+        self.pairs = [
+            'EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 
+            'GBP_USD', 'GBP_JPY', 'XAU_USD', 'EUR_JPY', 
+            'AUD_JPY', 'USD_CHF', 'NZD_USD', 'EUR_GBP', 
+            'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'
+        ]
+
         # OANDA Configuration
         self.oanda_api_key = os.getenv('OANDA_API_KEY')
         
@@ -73,14 +81,6 @@ class ForexLiveTradeBot:
                 self.logger.error(f"Failed to initialize Telegram bot: {e}")
                 self.telegram_bot = None
                 self.telegram_app = None
-
-        # Trading Pairs
-        self.pairs = [
-            'EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 
-            'GBP_USD', 'GBP_JPY', 'XAU_USD', 'EUR_JPY', 
-            'AUD_JPY', 'USD_CHF', 'NZD_USD', 'EUR_GBP', 
-            'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'
-        ]
 
         # Trading Parameters
         self.timeframe = 'M30'
