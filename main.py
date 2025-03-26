@@ -25,6 +25,10 @@ from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import uvicorn
 
+import nest_asyncio
+nest_asyncio.apply()
+
+
 # Environment Variables
 from dotenv import load_dotenv
 load_dotenv()
@@ -58,47 +62,38 @@ class ForexLiveTradeBot:
         self.telegram_token = os.getenv('TELEGRAM_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
-        if not self.telegram_token or not self.telegram_chat_id:
-            self.logger.warning("Telegram bot token or chat ID is missing")
-            self.telegram_bot = None
-            self.telegram_app = None
-        else:
+        if self.telegram_token and self.telegram_chat_id:
             try:
-                self.telegram_app = ApplicationBuilder().token(self.telegram_token).build()
-                self.telegram_bot = self.telegram_app.bot
+                from telegram import Bot as TelegramBot
+                self.telegram_bot = TelegramBot(token=self.telegram_token)
                 self.logger.info("Telegram bot initialized successfully")
                 
-                # Send startup message
-                asyncio.run(self.async_send_telegram_signal({
+                # Send startup message synchronously
+                self.send_telegram_signal({
                     'pair': 'SYSTEM',
                     'type': 'STARTUP',
                     'entry_price': 0,
                     'stop_loss': 0,
                     'take_profit': 0,
                     'custom_message': f"🤖 Trading Bot Started\nTimestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nTrading Pairs: {', '.join(self.pairs)}"
-                }))
+                })
             except Exception as e:
                 self.logger.error(f"Failed to initialize Telegram bot: {e}")
                 self.telegram_bot = None
-                self.telegram_app = None
 
-        # Trading Parameters
-        self.timeframe = 'M30'
-        self.risk_amount = 100.0
-        self.min_risk_reward = 1.75
-
-    async def async_send_telegram_signal(self, signal: dict):
+    def send_telegram_signal(self, signal: dict):
         """
-        Asynchronously send trade signal to Telegram with improved error handling
+        Send Telegram signal synchronously
         """
         if not self.telegram_bot:
             return
         
-        # Check if there's a custom message
-        if 'custom_message' in signal:
-            message = signal['custom_message']
-        else:
-            message = f"""🚨 NEW TRADE SIGNAL 🚨
+        try:
+            # Check if there's a custom message
+            if 'custom_message' in signal:
+                message = signal['custom_message']
+            else:
+                message = f"""🚨 NEW TRADE SIGNAL 🚨
 Pair: {signal['pair']}
 Type: {signal['type']}
 Entry Price: {signal['entry_price']:.4f}
@@ -106,33 +101,14 @@ Stop Loss: {signal['stop_loss']:.4f}
 Take Profit: {signal['take_profit']:.4f}
 Risk Reward: {self.min_risk_reward}:1
 """
-        
-        try:
-            # Use asyncio's get_event_loop() to ensure a running event loop
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
             
-            await self.telegram_bot.send_message(
+            # Send message synchronously
+            self.telegram_bot.send_message(
                 chat_id=self.telegram_chat_id, 
                 text=message
             )
         except Exception as e:
             self.logger.error(f"Error sending Telegram message: {str(e)}")
-
-    def send_telegram_signal(self, signal: dict):
-        """
-        Wrapper method to send Telegram signal synchronously with improved event loop handling
-        """
-        if self.telegram_bot:
-            # Create a new event loop for each call to avoid event loop closure issues
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self.async_send_telegram_signal(signal))
-            finally:
-                loop.close()
 
     def fetch_historical_data(self, pair: str, count: int = 500) -> pd.DataFrame:
         """
