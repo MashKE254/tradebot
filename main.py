@@ -5,6 +5,7 @@ import schedule
 import time
 import threading
 from datetime import datetime, timedelta
+import asyncio
 
 import pandas as pd
 import numpy as np
@@ -17,6 +18,7 @@ from oandapyV20 import API
 
 # Telegram Bot
 from telegram import Bot
+from telegram.ext import ApplicationBuilder
 
 # FastAPI
 from fastapi import FastAPI, BackgroundTasks
@@ -49,9 +51,28 @@ class ForexLiveTradeBot:
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
         if not self.telegram_token or not self.telegram_chat_id:
-            raise ValueError("Telegram bot token and chat ID are required")
-        
-        self.telegram_bot = Bot(token=self.telegram_token)
+            self.logger.warning("Telegram bot token or chat ID is missing")
+            self.telegram_bot = None
+            self.telegram_app = None
+        else:
+            try:
+                self.telegram_app = ApplicationBuilder().token(self.telegram_token).build()
+                self.telegram_bot = self.telegram_app.bot
+                self.logger.info("Telegram bot initialized successfully")
+                
+                # Send startup message
+                asyncio.run(self.async_send_telegram_signal({
+                    'pair': 'SYSTEM',
+                    'type': 'STARTUP',
+                    'entry_price': 0,
+                    'stop_loss': 0,
+                    'take_profit': 0,
+                    'custom_message': f"🤖 Trading Bot Started\nTimestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nTrading Pairs: {', '.join(self.pairs)}"
+                }))
+            except Exception as e:
+                self.logger.error(f"Failed to initialize Telegram bot: {e}")
+                self.telegram_bot = None
+                self.telegram_app = None
 
         # Trading Pairs
         self.pairs = [
@@ -65,6 +86,41 @@ class ForexLiveTradeBot:
         self.timeframe = 'M30'
         self.risk_amount = 100.0
         self.min_risk_reward = 1.75
+
+    async def async_send_telegram_signal(self, signal: dict):
+        """
+        Asynchronously send trade signal to Telegram
+        """
+        if not self.telegram_bot:
+            return
+        
+        # Check if there's a custom message
+        if 'custom_message' in signal:
+            message = signal['custom_message']
+        else:
+            message = f"""🚨 NEW TRADE SIGNAL 🚨
+Pair: {signal['pair']}
+Type: {signal['type']}
+Entry Price: {signal['entry_price']:.4f}
+Stop Loss: {signal['stop_loss']:.4f}
+Take Profit: {signal['take_profit']:.4f}
+Risk Reward: {self.min_risk_reward}:1
+"""
+        
+        try:
+            await self.telegram_bot.send_message(
+                chat_id=self.telegram_chat_id, 
+                text=message
+            )
+        except Exception as e:
+            self.logger.error(f"Error sending Telegram message: {str(e)}")
+
+    def send_telegram_signal(self, signal: dict):
+        """
+        Wrapper method to send Telegram signal synchronously
+        """
+        if self.telegram_bot:
+            asyncio.run(self.async_send_telegram_signal(signal))
 
     def fetch_historical_data(self, pair: str, count: int = 500) -> pd.DataFrame:
         """
@@ -197,30 +253,6 @@ class ForexLiveTradeBot:
         
         return None
 
-    def send_telegram_signal(self, signal: dict):
-        """
-        Send trade signal to Telegram
-        """
-        if not signal:
-            return
-        
-        message = f"""🚨 NEW TRADE SIGNAL 🚨
-Pair: {signal['pair']}
-Type: {signal['type']}
-Entry Price: {signal['entry_price']:.4f}
-Stop Loss: {signal['stop_loss']:.4f}
-Take Profit: {signal['take_profit']:.4f}
-Risk Reward: {self.min_risk_reward}:1
-"""
-        
-        try:
-            self.telegram_bot.send_message(
-                chat_id=self.telegram_chat_id, 
-                text=message
-            )
-        except Exception as e:
-            self.logger.error(f"Error sending Telegram message: {str(e)}")
-
     def scan_markets(self, specific_pairs=None):
         """
         Scan all market pairs for trade signals
@@ -299,7 +331,8 @@ async def health_check():
         "status": "alive",
         "current_pairs": trading_bot.pairs,
         "risk_amount": trading_bot.risk_amount,
-        "min_risk_reward": trading_bot.min_risk_reward
+        "min_risk_reward": trading_bot.min_risk_reward,
+        "telegram_configured": bool(trading_bot.telegram_bot)
     }
 
 def start_bot():
