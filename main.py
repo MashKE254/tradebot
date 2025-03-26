@@ -39,7 +39,7 @@ class ForexLiveTradeBot:
         # OANDA Configuration
         self.oanda_api_key = os.getenv('OANDA_API_KEY')
         
-        if not self.oanda_api_key or not self.oanda_account_id:
+        if not self.oanda_api_key:
             raise ValueError("OANDA API credentials are required")
         
         self.oanda_client = API(access_token=self.oanda_api_key)
