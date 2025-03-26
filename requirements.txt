@@ -1,11 +1,25 @@
-fastapi
-uvicorn
-python-dotenv
+# Core Python Libraries
 pytz
 schedule
+asyncio
+
+# Data Manipulation
 pandas
 numpy
+
+# API and HTTP Requests
 requests
+python-dotenv
+
+# OANDA API
 oandapyV20
+
+# Telegram Bot
 python-telegram-bot
+
+# FastAPI and Server
+fastapi
+uvicorn
+
+# Additional Utilities
 nest_asyncio
