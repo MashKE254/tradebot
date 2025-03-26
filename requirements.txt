@@ -8,3 +8,4 @@ numpy
 requests
 oandapyV20
 python-telegram-bot
+nest_asyncio
