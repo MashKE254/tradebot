@@ -6,6 +6,7 @@ import time
 import threading
 from datetime import datetime, timedelta
 import asyncio
+import nest_asyncio
 
 import pandas as pd
 import numpy as np
@@ -25,13 +26,12 @@ from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 import uvicorn
 
-import nest_asyncio
-nest_asyncio.apply()
-
-
 # Environment Variables
 from dotenv import load_dotenv
 load_dotenv()
+
+# Apply nest_asyncio to handle event loop issues
+nest_asyncio.apply()
 
 class ForexLiveTradeBot:
     def __init__(self):
@@ -42,7 +42,7 @@ class ForexLiveTradeBot:
         )
         self.logger = logging.getLogger(__name__)
 
-        # Trading Pairs - MOVED THIS BEFORE TELEGRAM INITIALIZATION
+        # Trading Pairs
         self.pairs = [
             'EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 
             'GBP_USD', 'GBP_JPY', 'XAU_USD', 'EUR_JPY', 
@@ -61,29 +61,35 @@ class ForexLiveTradeBot:
         # Telegram Configuration
         self.telegram_token = os.getenv('TELEGRAM_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.telegram_bot = None
         
         if self.telegram_token and self.telegram_chat_id:
             try:
-                from telegram import Bot as TelegramBot
-                self.telegram_bot = TelegramBot(token=self.telegram_token)
+                # Initialize Telegram Bot
+                self.telegram_bot = Bot(token=self.telegram_token)
                 self.logger.info("Telegram bot initialized successfully")
                 
-                # Send startup message synchronously
-                self.send_telegram_signal({
+                # Send startup message
+                asyncio.run(self.send_telegram_signal({
                     'pair': 'SYSTEM',
                     'type': 'STARTUP',
                     'entry_price': 0,
                     'stop_loss': 0,
                     'take_profit': 0,
                     'custom_message': f"🤖 Trading Bot Started\nTimestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nTrading Pairs: {', '.join(self.pairs)}"
-                })
+                }))
             except Exception as e:
                 self.logger.error(f"Failed to initialize Telegram bot: {e}")
                 self.telegram_bot = None
 
-    def send_telegram_signal(self, signal: dict):
+        # Trading Parameters
+        self.timeframe = 'M30'
+        self.risk_amount = 100.0
+        self.min_risk_reward = 1.75
+
+    async def send_telegram_signal(self, signal: dict):
         """
-        Send Telegram signal synchronously
+        Asynchronously send trade signal to Telegram
         """
         if not self.telegram_bot:
             return
@@ -102,13 +108,20 @@ Take Profit: {signal['take_profit']:.4f}
 Risk Reward: {self.min_risk_reward}:1
 """
             
-            # Send message synchronously
-            self.telegram_bot.send_message(
+            # Send message asynchronously
+            await self.telegram_bot.send_message(
                 chat_id=self.telegram_chat_id, 
                 text=message
             )
         except Exception as e:
             self.logger.error(f"Error sending Telegram message: {str(e)}")
+
+    def sync_send_telegram_signal(self, signal: dict):
+        """
+        Synchronous wrapper for async send_telegram_signal
+        """
+        if self.telegram_bot:
+            asyncio.run(self.send_telegram_signal(signal))
 
     def fetch_historical_data(self, pair: str, count: int = 500) -> pd.DataFrame:
         """
@@ -265,7 +278,8 @@ Risk Reward: {self.min_risk_reward}:1
                 
                 if signal:
                     signals.append(signal)
-                    self.send_telegram_signal(signal)
+                    # Use sync_send_telegram_signal
+                    self.sync_send_telegram_signal(signal)
                 
             except Exception as e:
                 self.logger.error(f"Error processing {pair}: {str(e)}")
