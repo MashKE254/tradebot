@@ -89,7 +89,7 @@ class ForexLiveTradeBot:
 
     async def async_send_telegram_signal(self, signal: dict):
         """
-        Asynchronously send trade signal to Telegram
+        Asynchronously send trade signal to Telegram with improved error handling
         """
         if not self.telegram_bot:
             return
@@ -108,6 +108,12 @@ Risk Reward: {self.min_risk_reward}:1
 """
         
         try:
+            # Use asyncio's get_event_loop() to ensure a running event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            
             await self.telegram_bot.send_message(
                 chat_id=self.telegram_chat_id, 
                 text=message
@@ -117,10 +123,16 @@ Risk Reward: {self.min_risk_reward}:1
 
     def send_telegram_signal(self, signal: dict):
         """
-        Wrapper method to send Telegram signal synchronously
+        Wrapper method to send Telegram signal synchronously with improved event loop handling
         """
         if self.telegram_bot:
-            asyncio.run(self.async_send_telegram_signal(signal))
+            # Create a new event loop for each call to avoid event loop closure issues
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self.async_send_telegram_signal(signal))
+            finally:
+                loop.close()
 
     def fetch_historical_data(self, pair: str, count: int = 500) -> pd.DataFrame:
         """
