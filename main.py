@@ -58,6 +58,10 @@ class ForexLiveTradeBot:
         
         self.oanda_client = API(access_token=self.oanda_api_key)
 
+        # Create a single event loop
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+
         # Telegram Configuration
         self.telegram_token = os.getenv('TELEGRAM_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
@@ -69,8 +73,8 @@ class ForexLiveTradeBot:
                 self.telegram_bot = Bot(token=self.telegram_token)
                 self.logger.info("Telegram bot initialized successfully")
                 
-                # Send startup message
-                asyncio.run(self.send_telegram_signal({
+                # Send startup message using loop
+                self.loop.run_until_complete(self.send_telegram_signal({
                     'pair': 'SYSTEM',
                     'type': 'STARTUP',
                     'entry_price': 0,
@@ -81,11 +85,6 @@ class ForexLiveTradeBot:
             except Exception as e:
                 self.logger.error(f"Failed to initialize Telegram bot: {e}")
                 self.telegram_bot = None
-
-        # Trading Parameters
-        self.timeframe = 'M30'
-        self.risk_amount = 100.0
-        self.min_risk_reward = 1.75
 
     async def send_telegram_signal(self, signal: dict):
         """
@@ -121,7 +120,8 @@ Risk Reward: {self.min_risk_reward}:1
         Synchronous wrapper for async send_telegram_signal
         """
         if self.telegram_bot:
-            asyncio.run(self.send_telegram_signal(signal))
+            # Use the instance's event loop
+            self.loop.run_until_complete(self.send_telegram_signal(signal))
 
     def fetch_historical_data(self, pair: str, count: int = 500) -> pd.DataFrame:
         """
