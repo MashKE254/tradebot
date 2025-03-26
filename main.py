@@ -45,7 +45,7 @@ class ForexLiveTradeBot:
         self.oanda_client = API(access_token=self.oanda_api_key)
 
         # Telegram Configuration
-        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.telegram_token = os.getenv('TELEGRAM_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
         if not self.telegram_token or not self.telegram_chat_id:
