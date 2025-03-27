@@ -50,6 +50,13 @@ class ForexLiveTradeBot:
             'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'
         ]
 
+        # Add default timeframe
+        self.timeframe = 'M30'  # 4-hour candles
+
+        # Risk Management
+        self.risk_amount = 100  # Default risk per trade
+        self.min_risk_reward = 1.75  # Minimum risk-reward ratio
+
         # OANDA Configuration
         self.oanda_api_key = os.getenv('OANDA_API_KEY')
         
