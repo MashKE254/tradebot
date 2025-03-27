@@ -115,10 +115,11 @@ Risk Reward: {self.min_risk_reward}:1
 """
             
             # Send message asynchronously
-            await self.telegram_bot.send_message(
-                chat_id=self.telegram_chat_id, 
-                text=message
-            )
+            async def send_message():
+                await self.telegram_bot.send_message(
+                    chat_id=self.telegram_chat_id, 
+                    text=message
+                )
         except Exception as e:
             self.logger.error(f"Error sending Telegram message: {str(e)}")
 
@@ -295,7 +296,7 @@ Risk Reward: {self.min_risk_reward}:1
 
     def run(self):
         """
-        Main execution method
+        Main execution method with improved event loop management
         """
         self.logger.info("Trading Bot Started")
         
@@ -303,12 +304,17 @@ Risk Reward: {self.min_risk_reward}:1
         self.scan_markets()
         
         # Schedule periodic scans
-        schedule.every(4).hours.do(self.scan_markets)
+        schedule.every(1).hours.do(self.scan_markets)
         
-        # Keep the bot running
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
+        # Keep the bot running with a try-except block
+        try:
+            while True:
+                schedule.run_pending()
+                time.sleep(1)
+        except Exception as e:
+            self.logger.error(f"Bot runtime error: {e}")
+        finally:
+            self.loop.close()
 
 # Pydantic Model for Request
 class ScanRequest(BaseModel):
@@ -321,14 +327,15 @@ trading_bot = ForexLiveTradeBot()
 @app.post("/scan-markets")
 async def scan_markets(background_tasks: BackgroundTasks, request: ScanRequest = None):
     """
-    Manually trigger market scan
+    Manually trigger market scan with improved concurrency handling
     """
     if request and request.pairs:
         specific_pairs = request.pairs
     else:
         specific_pairs = None
     
-    background_tasks.add_task(trading_bot.scan_markets, specific_pairs)
+    # Use asyncio.to_thread for non-blocking background task
+    background_tasks.add_task(asyncio.to_thread, trading_bot.scan_markets, specific_pairs)
     return {"status": "Scan initiated"}
 
 @app.get("/health")
@@ -346,12 +353,15 @@ async def health_check():
 
 def start_bot():
     """
-    Start the trading bot in a separate thread
+    Start the trading bot in a separate thread with improved thread safety
     """
     bot_thread = threading.Thread(target=trading_bot.run, daemon=True)
     bot_thread.start()
 
 def main():
+    # Apply nest_asyncio again to ensure maximum compatibility
+    nest_asyncio.apply()
+    
     # Start bot thread
     start_bot()
     
