@@ -51,7 +51,7 @@ class ForexLiveTradeBot:
         ]
 
         # Add default timeframe
-        self.timeframe = 'M30'  # 4-hour candles
+        self.timeframe = 'M30' 
 
         # Risk Management
         self.risk_amount = 100  # Default risk per trade
