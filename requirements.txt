@@ -2,6 +2,7 @@
 pytz
 schedule
 asyncio
+APScheduler
 
 # Data Manipulation
 pandas
