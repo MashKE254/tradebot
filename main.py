@@ -59,7 +59,7 @@ class ForexBotConfig(BaseModel):
                 'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'],
         description="List of forex pairs to monitor"
     )
-    timeframe: str = Field(default='H1', description="Timeframe for analysis")
+    timeframe: str = Field(default='M30', description="Timeframe for analysis")
     risk_amount: float = Field(default=100.0, description="Risk amount per trade")
     min_risk_reward: float = Field(default=1.75, description="Minimum risk-reward ratio")
     telegram: TelegramConfig = Field(default=TelegramConfig(), description="Telegram notification settings")
