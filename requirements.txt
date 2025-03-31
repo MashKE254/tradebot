@@ -24,4 +24,4 @@ uvicorn
 # Additional Utilities
 nest_asyncio
 
-matplotlib.pyplot
+matplotlib
