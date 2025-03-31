@@ -138,7 +138,7 @@ class OANDAForexBot:
     
     async def load_historical_data(self, 
                           pair: str, 
-                          timeframe: str = 'H1',
+                          timeframe: str = 'M30',
                           count: int = 500) -> pd.DataFrame:
         """
         Load historical price data from OANDA API
@@ -318,7 +318,7 @@ class OANDAForexBot:
         
         return signals
     
-    async def scan_market(self, timeframe: str = 'H1'):
+    async def scan_market(self, timeframe: str = 'M30'):
         """
         Scan the market for all currency pairs and generate signals
         """
