@@ -429,7 +429,7 @@ async def startup_event():
     # Initialize the forex bot
     forex_bot = OANDAForexBot(
         api_key=os.getenv("OANDA_API_KEY"),
-        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
+        telegram_bot_token=os.getenv("TELEGRAM_TOKEN"),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
         pairs=config.pairs,
         risk_amount=config.risk_amount,
