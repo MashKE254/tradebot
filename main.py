@@ -440,8 +440,7 @@ async def startup_event():
     scheduler.add_job(
         forex_bot.scan_market, 
         'cron', 
-        hour='*', 
-        minute='1',  # Run at 1 minute past every hour
+        minute='*/30',  # Run every 30 minutes
         kwargs={"timeframe": config.timeframe}
     )
     
@@ -515,8 +514,7 @@ async def update_config(new_config: ForexBotConfig):
     scheduler.add_job(
         forex_bot.scan_market, 
         'cron', 
-        hour='*', 
-        minute='1',
+        minute='*/30',  # Run every 30 minutes
         kwargs={"timeframe": config.timeframe}
     )
     
