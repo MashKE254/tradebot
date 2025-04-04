@@ -127,14 +127,31 @@ class OANDAForexBot:
             return
         
         try:
+            # Use MarkdownV2 instead of Markdown for better compatibility
+            # Escape special characters to prevent parsing errors
+            escaped_message = message.replace('.', '\\.').replace('-', '\\-').replace('+', '\\+').replace('(', '\\(').replace(')', '\\)').replace('!', '\\!')
+            
+            # Keep asterisks for bold formatting but ensure they're properly paired
+            
             await self.telegram_bot.send_message(
                 chat_id=self.telegram_chat_id,
-                text=message,
-                parse_mode="Markdown"
+                text=escaped_message,
+                parse_mode="MarkdownV2"  # Use MarkdownV2 instead of Markdown
             )
             logger.info(f"Telegram message sent: {message[:50]}...")
         except Exception as e:
             logger.error(f"Failed to send Telegram message: {str(e)}")
+            
+            # Fallback: Try without markdown if parsing failed
+            try:
+                await self.telegram_bot.send_message(
+                    chat_id=self.telegram_chat_id,
+                    text=message.replace('*', ''),  # Remove markdown formatting
+                    parse_mode=None  # No parsing
+                )
+                logger.info("Telegram message sent without markdown formatting")
+            except Exception as e2:
+                logger.error(f"Failed to send Telegram fallback message: {str(e2)}")
     
     async def load_historical_data(self, 
                           pair: str, 
