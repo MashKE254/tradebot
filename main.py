@@ -55,8 +55,8 @@ class TelegramConfig(BaseModel):
 class ForexBotConfig(BaseModel):
     pairs: List[str] = Field(
         default=['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 'GBP_USD', 'GBP_JPY', 
-                'XAU_USD', 'EUR_JPY', 'AUD_JPY', 'USD_CHF', 'NZD_USD', 'EUR_GBP', 
-                'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'],
+                 'XAU_USD', 'EUR_JPY', 'AUD_JPY', 'USD_CHF', 'NZD_USD', 'EUR_GBP', 
+                 'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'],
         description="List of forex pairs to monitor"
     )
     timeframe: str = Field(default='M30', description="Timeframe for analysis")
@@ -101,8 +101,8 @@ class OANDAForexBot:
         
         # Forex pairs to monitor
         self.pairs = pairs or ['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 
-                              'GBP_USD', 'GBP_JPY', 'XAU_USD', 'EUR_JPY', 'AUD_JPY', 
-                              'USD_CHF', 'NZD_USD', 'EUR_GBP', 'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD']
+                               'GBP_USD', 'GBP_JPY', 'XAU_USD', 'EUR_JPY', 'AUD_JPY', 
+                               'USD_CHF', 'NZD_USD', 'EUR_GBP', 'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD']
         self.risk_amount = risk_amount
         self.min_risk_reward = min_risk_reward
         
@@ -154,9 +154,9 @@ class OANDAForexBot:
                 logger.error(f"Failed to send Telegram fallback message: {str(e2)}")
     
     async def load_historical_data(self, 
-                          pair: str, 
-                          timeframe: str = 'M30',
-                          count: int = 500) -> pd.DataFrame:
+                                   pair: str, 
+                                   timeframe: str = 'M30',
+                                   count: int = 500) -> pd.DataFrame:
         """
         Load historical price data from OANDA API
         """
@@ -453,20 +453,20 @@ async def startup_event():
         min_risk_reward=config.min_risk_reward
     )
     
-    # Schedule market scanning tasks
+    # Schedule market scanning tasks every 5 minutes
     scheduler.add_job(
         forex_bot.scan_market, 
         'cron', 
-        minute='*/30',  # Run every 30 minutes
+        minute='*/5',  # Run every 5 minutes
         kwargs={"timeframe": config.timeframe}
     )
     
-    # Schedule daily report
+    # Schedule daily report at 00:05 daily
     scheduler.add_job(
         forex_bot.generate_daily_report,
         'cron',
         hour='0',
-        minute='5'  # Run at 00:05 daily
+        minute='5'
     )
     
     # Start the scheduler
@@ -478,7 +478,7 @@ async def startup_event():
         "*🤖 FOREX TRADING BOT STARTED*\n\n" +
         f"Monitoring {len(config.pairs)} currency pairs\n" +
         f"Timeframe: {config.timeframe}\n" +
-        "Bot will scan the market hourly and send signals when found."
+        "Bot will scan the market every 5 minutes and send signals when found."
     )
 
 # FastAPI shutdown event
@@ -527,11 +527,11 @@ async def update_config(new_config: ForexBotConfig):
     # Restart scheduler with new settings
     scheduler.remove_all_jobs()
     
-    # Add scanning job
+    # Add scanning job every 5 minutes
     scheduler.add_job(
         forex_bot.scan_market, 
         'cron', 
-        minute='*/30',  # Run every 30 minutes
+        minute='*/5',  # Run every 5 minutes
         kwargs={"timeframe": config.timeframe}
     )
     
