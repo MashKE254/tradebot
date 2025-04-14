@@ -1,37 +1,32 @@
 import os
+import asyncio
+import logging
+import pytz
+import uvicorn
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from typing import List, Dict, Tuple, Optional
-import pytz
-from datetime import datetime, timedelta
-import logging
-import asyncio
-import telegram
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import secrets
-import uvicorn
+from typing import List, Dict, Optional, Set
+from datetime import datetime, timedelta, time
+import matplotlib.pyplot as plt
+import io
+import base64
+import telegram
+from telegram.error import TelegramError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import json
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 # OANDA API imports
 from oandapyV20 import API
+from oandapyV20.exceptions import V20Error
 from oandapyV20.contrib.factories import InstrumentsCandlesFactory
 import oandapyV20.endpoints.instruments as instruments
 
 # Load environment variables
 load_dotenv()
-
-# Initialize FastAPI app
-app = FastAPI(title="Forex Trading Signal Bot", 
-              description="A bot that analyzes forex markets and sends trading signals via Telegram",
-              version="1.0.0")
-
-# Security for API endpoints
-security = HTTPBasic()
 
 # Configure logging
 logging.basicConfig(
@@ -42,134 +37,166 @@ logging.basicConfig(
         logging.FileHandler("forex_bot.log")
     ]
 )
-logger = logging.getLogger("forex_bot")
+logger = logging.getLogger(__name__)
 
-# Scheduler for periodic tasks
-scheduler = AsyncIOScheduler()
+# Initialize FastAPI app
+app = FastAPI(title="Forex Trading Signal Bot", description="Real-time forex trading signals based on technical indicators")
 
-# Pydantic models for API requests and responses
-class TelegramConfig(BaseModel):
-    enabled: bool = Field(default=True, description="Whether to enable Telegram notifications")
-    chat_id: Optional[str] = Field(default=None, description="Telegram chat ID to send messages to")
+# Enable CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-class ForexBotConfig(BaseModel):
-    pairs: List[str] = Field(
-        default=['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 'GBP_USD', 'GBP_JPY', 
-                 'XAU_USD', 'EUR_JPY', 'AUD_JPY', 'USD_CHF', 'NZD_USD', 'EUR_GBP', 
-                 'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'],
-        description="List of forex pairs to monitor"
-    )
-    timeframe: str = Field(default='M30', description="Timeframe for analysis")
-    risk_amount: float = Field(default=100.0, description="Risk amount per trade")
-    min_risk_reward: float = Field(default=1.75, description="Minimum risk-reward ratio")
-    telegram: TelegramConfig = Field(default=TelegramConfig(), description="Telegram notification settings")
-
+# Pydantic models for request/response validation
 class TradeSignal(BaseModel):
     pair: str
-    type: str  # LONG or SHORT
+    type: str
     entry_price: float
     entry_time: datetime
     stop_loss: float
     take_profit: float
-    risk_reward_ratio: float
+    risk_reward: float
 
-class OANDAForexBot:
-    def __init__(self, 
-                 api_key: str = None,
-                 pairs: List[str] = None, 
-                 risk_amount: float = 100.0, 
-                 min_risk_reward: float = 1.75,
-                 telegram_bot_token: str = None,
-                 telegram_chat_id: str = None,
-                 environment: str = "practice"):
-        """
-        Initialize the Forex Trading Bot
-        """
+class BacktestResult(BaseModel):
+    pair: str
+    type: str
+    entry_price: float
+    entry_time: datetime
+    exit_price: float
+    exit_time: datetime
+    result: str
+    profit: float
+
+class ForexTradingBot:
+    def __init__(
+        self,
+        api_key: str = None,
+        pairs: List[str] = None,
+        initial_balance: float = 10000.0,
+        risk_amount: float = 100.0,
+        min_risk_reward: float = 1.75,
+        daily_loss_limit: float = 0.05,
+        environment: str = "practice",
+        telegram_token: str = None,
+        telegram_chat_id: str = None,
+        timeframe: str = "H1"
+    ):
+        # API setup
         self.api_key = api_key or os.getenv("OANDA_API_KEY")
         if not self.api_key:
             raise ValueError("OANDA API key is required")
         
-        self.telegram_bot_token = telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN")
-        self.telegram_chat_id = telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
-        
-        # Initialize OANDA API client
         self.client = API(
-            access_token=self.api_key, 
+            access_token=self.api_key,
             environment=environment,
             headers={"Authorization": f"Bearer {self.api_key}"}
         )
         
-        # Forex pairs to monitor
-        self.pairs = pairs or ['EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 
-                               'GBP_USD', 'GBP_JPY', 'XAU_USD', 'EUR_JPY', 'AUD_JPY', 
-                               'USD_CHF', 'NZD_USD', 'EUR_GBP', 'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD']
+        # Trading parameters
+        self.pairs = pairs or [
+            'EUR_USD', 'USD_JPY', 'AUD_USD', 'USD_CAD', 'GBP_USD', 
+            'GBP_JPY', 'XAU_USD', 'EUR_JPY', 'AUD_JPY', 'USD_CHF', 
+            'NZD_USD', 'EUR_GBP', 'EUR_AUD', 'GBP_AUD', 'AUD_NZD', 'GBP_NZD'
+        ]
+        self.initial_balance = initial_balance
+        self.current_balance = initial_balance
         self.risk_amount = risk_amount
         self.min_risk_reward = min_risk_reward
+        self.daily_loss_limit = daily_loss_limit
+        self.timeframe = timeframe
         
-        # Tracking metrics
-        self.active_signals = []
-        self.historical_signals = []
-        
-        # Initialize Telegram bot if credentials provided
+        # Telegram setup
+        self.telegram_token = telegram_token or os.getenv("TELEGRAM_TOKEN")
+        self.telegram_chat_id = telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID")
         self.telegram_bot = None
-        if self.telegram_bot_token:
-            self.telegram_bot = telegram.Bot(token=self.telegram_bot_token)
-            logger.info("Telegram bot initialized")
-        else:
-            logger.warning("Telegram bot token not provided. Notifications disabled.")
-    
-    async def send_telegram_message(self, message: str):
-        """
-        Send a message via Telegram
-        """
+        if self.telegram_token and self.telegram_chat_id:
+            self.telegram_bot = telegram.Bot(token=self.telegram_token)
+        
+        # State tracking
+        self.active_trades: Dict[str, TradeSignal] = {}
+        self.historical_trades: List[BacktestResult] = []
+        self.last_check_time = datetime.utcnow() - timedelta(hours=1)  # Initialize to 1 hour ago
+        
+        # Create scheduler for periodic tasks
+        self.scheduler = AsyncIOScheduler()
+        
+        logger.info(f"Forex Trading Bot initialized with {len(self.pairs)} currency pairs")
+
+    async def send_telegram_message(self, message: str) -> bool:
+        """Send message to Telegram chat"""
         if not self.telegram_bot or not self.telegram_chat_id:
-            logger.warning("Telegram notification not sent: missing bot token or chat ID")
-            return
+            logger.warning("Telegram bot not configured. Message not sent.")
+            return False
         
         try:
-            # Use MarkdownV2 instead of Markdown for better compatibility
-            # Escape special characters to prevent parsing errors
-            escaped_message = message.replace('.', '\\.').replace('-', '\\-').replace('+', '\\+').replace('(', '\\(').replace(')', '\\)').replace('!', '\\!')
-            
-            # Keep asterisks for bold formatting but ensure they're properly paired
-            
             await self.telegram_bot.send_message(
                 chat_id=self.telegram_chat_id,
-                text=escaped_message,
-                parse_mode="MarkdownV2"  # Use MarkdownV2 instead of Markdown
+                text=message,
+                parse_mode='Markdown'
             )
-            logger.info(f"Telegram message sent: {message[:50]}...")
-        except Exception as e:
-            logger.error(f"Failed to send Telegram message: {str(e)}")
-            
-            # Fallback: Try without markdown if parsing failed
-            try:
-                await self.telegram_bot.send_message(
-                    chat_id=self.telegram_chat_id,
-                    text=message.replace('*', ''),  # Remove markdown formatting
-                    parse_mode=None  # No parsing
-                )
-                logger.info("Telegram message sent without markdown formatting")
-            except Exception as e2:
-                logger.error(f"Failed to send Telegram fallback message: {str(e2)}")
-    
-    async def load_historical_data(self, 
-                                   pair: str, 
-                                   timeframe: str = 'M30',
-                                   count: int = 500) -> pd.DataFrame:
-        """
-        Load historical price data from OANDA API
-        """
+            return True
+        except TelegramError as e:
+            logger.error(f"Failed to send Telegram message: {e}")
+            return False
+
+    async def send_telegram_image(self, image_data, caption: str = None) -> bool:
+        """Send image to Telegram chat"""
+        if not self.telegram_bot or not self.telegram_chat_id:
+            logger.warning("Telegram bot not configured. Image not sent.")
+            return False
+        
+        try:
+            await self.telegram_bot.send_photo(
+                chat_id=self.telegram_chat_id,
+                photo=image_data,
+                caption=caption,
+                parse_mode='Markdown'
+            )
+            return True
+        except TelegramError as e:
+            logger.error(f"Failed to send Telegram image: {e}")
+            return False
+
+    async def fetch_historical_data(
+        self,
+        pair: str,
+        timeframe: str = None,
+        start_date: datetime = None,
+        end_date: datetime = None,
+        count: int = 200
+    ) -> pd.DataFrame:
+        """Fetch historical price data from OANDA API"""
         try:
             logger.info(f"Fetching historical data for {pair}")
             
-            # Set up end date (current time)
-            end_date = datetime.utcnow()
+            # Use provided timeframe or default
+            tf = timeframe or self.timeframe
+            
+            # Set default end_date to now if not provided
+            if end_date is None:
+                end_date = datetime.utcnow()
+            
+            # Set default start_date if not provided
+            if start_date is None:
+                if tf == 'H1':
+                    # For H1, get 200 candles (about 8 days worth)
+                    start_date = end_date - timedelta(days=8)
+                elif tf == 'H4':
+                    # For H4, get 200 candles (about 33 days worth)
+                    start_date = end_date - timedelta(days=33)
+                else:
+                    # Default to 30 days
+                    start_date = end_date - timedelta(days=30)
             
             # Prepare API request parameters
             params = {
-                "count": count,
-                "granularity": timeframe,
+                "from": start_date.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "to": end_date.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "granularity": tf,
                 "price": "M"  # Midpoint pricing
             }
             
@@ -205,17 +232,18 @@ class OANDAForexBot:
             logger.info(f"Retrieved {len(df)} candles for {pair}")
             return df
         
+        except V20Error as e:
+            logger.error(f"OANDA API error for {pair}: {str(e)}")
+            return pd.DataFrame()
         except Exception as e:
             logger.error(f"Error fetching data for {pair}: {str(e)}")
             return pd.DataFrame()
-    
+
     def calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate technical indicators
+        """Calculate technical indicators for strategy"""
+        if data.empty:
+            return data
         
-        :param data: OHLC price data
-        :return: DataFrame with added indicator columns
-        """
         df = data.copy()
         
         # EMA Calculations
@@ -259,25 +287,16 @@ class OANDAForexBot:
         df['ADX'] = dx.rolling(14).mean()
         
         return df.dropna()
-    
-    def find_trading_signals(self, data: pd.DataFrame) -> List[Dict]:
-        """
-        Find potential trading signals based on strategy rules
+
+    def check_entry_conditions(self, data: pd.DataFrame) -> Optional[TradeSignal]:
+        """Check if current market conditions meet entry criteria"""
+        if data.empty or len(data) < 2:
+            return None
         
-        :param data: DataFrame with price and indicator data
-        :return: List of potential trade signals
-        """
-        signals = []
-        
-        # Ensure the pair is stored in the DataFrame
-        pair = data['pair'].iloc[0] if not data.empty and 'pair' in data.columns else 'UNKNOWN'
-        
-        # Only check the most recent completed candle
-        if len(data) < 2:  # Need at least 2 candles (previous + current)
-            return signals
-        
-        current = data.iloc[-2]  # Previous completed candle
-        next_bar = data.iloc[-1]  # Most recent candle
+        # Get last two candles for entry condition check
+        current = data.iloc[-2]
+        next_bar = data.iloc[-1]
+        pair = current['pair']
         
         # Long Entry Conditions
         long_conditions = (
@@ -297,306 +316,630 @@ class OANDAForexBot:
             current['ADX'] > 25
         )
         
-        # Generate lookback window for stop loss calculation
-        lookback_window = 10
-        pre_entry_data = data.iloc[-lookback_window-1:-1]  # Last 10 bars before current
-        
-        # Process Long signal
         if long_conditions:
             entry_price = next_bar['open']
+            # Simulate finding stop loss and take profit
+            lookback_window = 10
+            pre_entry_data = data.iloc[-lookback_window-2:-2]
             stop_loss = pre_entry_data['low'].min()
             take_profit = entry_price + (entry_price - stop_loss) * self.min_risk_reward
             
-            signals.append({
-                'type': 'LONG',
-                'entry_price': entry_price,
-                'entry_time': data.index[-1],
-                'pair': pair,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'risk_reward_ratio': self.min_risk_reward
-            })
+            return TradeSignal(
+                pair=pair,
+                type="LONG",
+                entry_price=entry_price,
+                entry_time=data.index[-1],
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                risk_reward=self.min_risk_reward
+            )
         
-        # Process Short signal
         if short_conditions:
             entry_price = next_bar['open']
+            # Simulate finding stop loss and take profit
+            lookback_window = 10
+            pre_entry_data = data.iloc[-lookback_window-2:-2]
             stop_loss = pre_entry_data['high'].max()
             take_profit = entry_price - (stop_loss - entry_price) * self.min_risk_reward
             
-            signals.append({
-                'type': 'SHORT',
-                'entry_price': entry_price,
-                'entry_time': data.index[-1],
-                'pair': pair,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'risk_reward_ratio': self.min_risk_reward
-            })
+            return TradeSignal(
+                pair=pair,
+                type="SHORT",
+                entry_price=entry_price,
+                entry_time=data.index[-1],
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                risk_reward=self.min_risk_reward
+            )
         
-        return signals
-    
-    async def scan_market(self, timeframe: str = 'M30'):
-        """
-        Scan the market for all currency pairs and generate signals
-        """
-        all_signals = []
+        return None
+
+    def check_trade_exits(self, active_trade: TradeSignal, current_data: pd.DataFrame) -> Optional[BacktestResult]:
+        """Check if an active trade should be closed"""
+        if current_data.empty:
+            return None
+        
+        # Get current price data
+        current_bar = current_data.iloc[-1]
+        current_time = current_data.index[-1]
+        
+        if active_trade.type == "LONG":
+            # Check stop loss
+            if current_bar['low'] <= active_trade.stop_loss:
+                return BacktestResult(
+                    pair=active_trade.pair,
+                    type=active_trade.type,
+                    entry_price=active_trade.entry_price,
+                    entry_time=active_trade.entry_time,
+                    exit_price=active_trade.stop_loss,
+                    exit_time=current_time,
+                    result="STOP_LOSS",
+                    profit=(active_trade.stop_loss - active_trade.entry_price) * 
+                           self.risk_amount / (active_trade.entry_price - active_trade.stop_loss)
+                )
+            
+            # Check take profit
+            if current_bar['high'] >= active_trade.take_profit:
+                return BacktestResult(
+                    pair=active_trade.pair,
+                    type=active_trade.type,
+                    entry_price=active_trade.entry_price,
+                    entry_time=active_trade.entry_time,
+                    exit_price=active_trade.take_profit,
+                    exit_time=current_time,
+                    result="TAKE_PROFIT",
+                    profit=(active_trade.take_profit - active_trade.entry_price) * 
+                           self.risk_amount / (active_trade.entry_price - active_trade.stop_loss)
+                )
+        
+        elif active_trade.type == "SHORT":
+            # Check stop loss
+            if current_bar['high'] >= active_trade.stop_loss:
+                return BacktestResult(
+                    pair=active_trade.pair,
+                    type=active_trade.type,
+                    entry_price=active_trade.entry_price,
+                    entry_time=active_trade.entry_time,
+                    exit_price=active_trade.stop_loss,
+                    exit_time=current_time,
+                    result="STOP_LOSS",
+                    profit=(active_trade.entry_price - active_trade.stop_loss) * 
+                           self.risk_amount / (active_trade.stop_loss - active_trade.entry_price)
+                )
+            
+            # Check take profit
+            if current_bar['low'] <= active_trade.take_profit:
+                return BacktestResult(
+                    pair=active_trade.pair,
+                    type=active_trade.type,
+                    entry_price=active_trade.entry_price,
+                    entry_time=active_trade.entry_time,
+                    exit_price=active_trade.take_profit,
+                    exit_time=current_time,
+                    result="TAKE_PROFIT",
+                    profit=(active_trade.entry_price - active_trade.take_profit) * 
+                           self.risk_amount / (active_trade.stop_loss - active_trade.entry_price)
+                )
+        
+        return None
+
+    async def generate_chart(self, pair: str) -> io.BytesIO:
+        """Generate chart for a specific pair"""
+        data = await self.fetch_historical_data(pair, count=100)
+        if data.empty:
+            raise ValueError(f"No data available for {pair}")
+        
+        data = self.calculate_indicators(data)
+        
+        # Create figure with 3 subplots
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [4, 1, 1]})
+        
+        # Plot price and EMAs on top subplot
+        ax1.plot(data.index, data['close'], label='Close Price')
+        ax1.plot(data.index, data['EMA50'], label='EMA50', color='orange')
+        ax1.plot(data.index, data['EMA200'], label='EMA200', color='red')
+        
+        # Add active trades if any
+        if pair in self.active_trades:
+            trade = self.active_trades[pair]
+            entry_time = trade.entry_time
+            ax1.axvline(x=entry_time, color='green' if trade.type == "LONG" else 'red', linestyle='--')
+            ax1.axhline(y=trade.entry_price, color='blue', linestyle='-')
+            ax1.axhline(y=trade.stop_loss, color='red', linestyle='-')
+            ax1.axhline(y=trade.take_profit, color='green', linestyle='-')
+        
+        ax1.set_title(f'{pair} - {self.timeframe} Timeframe')
+        ax1.set_ylabel('Price')
+        ax1.legend(loc='upper left')
+        ax1.grid(True)
+        
+        # Plot MACD on middle subplot
+        ax2.plot(data.index, data['MACD'], label='MACD', color='blue')
+        ax2.plot(data.index, data['Signal'], label='Signal', color='red')
+        ax2.bar(data.index, data['MACD_Hist'], label='Histogram', color='green', width=0.02, 
+                alpha=0.5)
+        ax2.set_ylabel('MACD')
+        ax2.legend(loc='upper left')
+        ax2.grid(True)
+        
+        # Plot RSI on bottom subplot
+        ax3.plot(data.index, data['RSI'], label='RSI', color='purple')
+        ax3.axhline(y=70, color='red', linestyle='--')
+        ax3.axhline(y=30, color='green', linestyle='--')
+        ax3.set_ylabel('RSI')
+        ax3.set_ylim(0, 100)
+        ax3.legend(loc='upper left')
+        ax3.grid(True)
+        
+        plt.tight_layout()
+        
+        # Save to BytesIO object
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close(fig)
+        
+        return buf
+
+    async def scan_for_signals(self) -> List[TradeSignal]:
+        """Scan all currency pairs for trading signals"""
+        signals = []
         
         for pair in self.pairs:
-            try:
-                # Load historical data
-                data = await self.load_historical_data(pair, timeframe=timeframe)
+            # Skip if we already have an active trade for this pair
+            if pair in self.active_trades:
+                continue
                 
-                # Skip if no data
+            try:
+                # Fetch and prepare data
+                data = await self.fetch_historical_data(pair)
                 if data.empty:
+                    logger.warning(f"No data available for {pair}, skipping...")
                     continue
                 
-                # Calculate indicators
-                indicators_data = self.calculate_indicators(data)
+                data = self.calculate_indicators(data)
                 
-                # Find potential trade signals
-                signals = self.find_trading_signals(indicators_data)
-                
-                # Process and notify for each signal
-                for signal in signals:
-                    all_signals.append(signal)
-                    
-                    # Create Telegram message for signal
-                    message = f"*🚨 NEW {signal['type']} SIGNAL*\n\n" + \
-                              f"*Pair:* {signal['pair']}\n" + \
-                              f"*Entry Price:* {signal['entry_price']:.5f}\n" + \
-                              f"*Stop Loss:* {signal['stop_loss']:.5f}\n" + \
-                              f"*Take Profit:* {signal['take_profit']:.5f}\n" + \
-                              f"*Risk/Reward:* {signal['risk_reward_ratio']:.2f}\n" + \
-                              f"*Time:* {signal['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}\n\n" + \
-                              f"📊 *Technical Analysis:*\n" + \
-                              f"• EMA50 {'above' if indicators_data.iloc[-1]['EMA50'] > indicators_data.iloc[-1]['EMA200'] else 'below'} EMA200\n" + \
-                              f"• MACD {'bullish crossover' if signal['type'] == 'LONG' else 'bearish crossover'}\n" + \
-                              f"• RSI: {indicators_data.iloc[-1]['RSI']:.1f}\n" + \
-                              f"• ADX: {indicators_data.iloc[-1]['ADX']:.1f}"
-                    
-                    # Send Telegram notification
-                    await self.send_telegram_message(message)
-                
-                logger.info(f"Analyzed {pair}: {len(signals)} signals generated")
-                
+                # Check for entry conditions
+                signal = self.check_entry_conditions(data)
+                if signal:
+                    signals.append(signal)
+                    logger.info(f"Found signal for {pair}: {signal.type} at {signal.entry_price}")
             except Exception as e:
-                logger.error(f"Error analyzing {pair}: {str(e)}")
+                logger.error(f"Error scanning {pair}: {str(e)}")
         
-        return all_signals
-    
-    async def generate_daily_report(self):
-        """
-        Generate and send a daily market report
-        """
+        return signals
+
+    async def update_active_trades(self) -> List[BacktestResult]:
+        """Update status of active trades and check for exits"""
+        closed_trades = []
+        
+        for pair, trade in list(self.active_trades.items()):
+            try:
+                # Fetch latest data
+                data = await self.fetch_historical_data(pair)
+                if data.empty:
+                    logger.warning(f"No data available to update trade for {pair}")
+                    continue
+                
+                # Check if trade should be closed
+                result = self.check_trade_exits(trade, data)
+                if result:
+                    closed_trades.append(result)
+                    self.historical_trades.append(result)
+                    del self.active_trades[pair]
+                    
+                    # Log and send notification
+                    logger.info(f"Closed trade for {pair}: {result.result} with profit {result.profit:.2f}")
+                    
+                    # Send notification to Telegram
+                    message = (
+                        f"🔔 *TRADE CLOSED*\n"
+                        f"Pair: *{pair}*\n"
+                        f"Type: *{result.type}*\n"
+                        f"Result: *{result.result}*\n"
+                        f"Entry: {result.entry_price:.5f}\n"
+                        f"Exit: {result.exit_price:.5f}\n"
+                        f"Profit: *${result.profit:.2f}*\n"
+                        f"Time Open: {(result.exit_time - result.entry_time).total_seconds() / 3600:.1f} hours"
+                    )
+                    await self.send_telegram_message(message)
+                    
+                    # Generate and send chart
+                    try:
+                        chart_buf = await self.generate_chart(pair)
+                        await self.send_telegram_image(chart_buf, f"Chart for {pair} after trade closed")
+                    except Exception as e:
+                        logger.error(f"Failed to generate or send chart: {e}")
+            
+            except Exception as e:
+                logger.error(f"Error updating trade for {pair}: {str(e)}")
+        
+        return closed_trades
+
+    async def run_scanner(self):
+        """Main scanner function to run periodically"""
+        logger.info("Running trading signal scanner")
+        
         try:
-            # Build report message
-            report = f"*📈 FOREX DAILY REPORT - {datetime.now().strftime('%Y-%m-%d')}*\n\n"
+            # Check for new signals
+            signals = await self.scan_for_signals()
             
-            # Add report content
-            report += f"*Active Trade Signals:* {len(self.active_signals)}\n"
-            report += f"*Generated Today:* {len([s for s in self.historical_signals if s['entry_time'].date() == datetime.now().date()])}\n\n"
-            
-            # Market overview
-            report += "*🌎 MARKET OVERVIEW:*\n"
-            
-            # Fetch latest price for major pairs
-            for pair in ['EUR_USD', 'GBP_USD', 'USD_JPY', 'AUD_USD']:
+            # Process new signals
+            for signal in signals:
+                # Record the signal as an active trade
+                self.active_trades[signal.pair] = signal
+                
+                # Send notification
+                message = (
+                    f"🔔 *NEW SIGNAL DETECTED*\n"
+                    f"Pair: *{signal.pair}*\n"
+                    f"Type: *{signal.type}*\n"
+                    f"Entry Price: {signal.entry_price:.5f}\n"
+                    f"Stop Loss: {signal.stop_loss:.5f}\n"
+                    f"Take Profit: {signal.take_profit:.5f}\n"
+                    f"Risk/Reward: {signal.risk_reward:.2f}\n"
+                    f"Time: {signal.entry_time.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+                )
+                await self.send_telegram_message(message)
+                
+                # Generate and send chart
                 try:
-                    data = await self.load_historical_data(pair, timeframe='H4', count=2)
-                    if not data.empty:
-                        price = data.iloc[-1]['close']
-                        change = ((price / data.iloc[0]['close']) - 1) * 100
-                        direction = "▲" if change > 0 else "▼"
-                        report += f"• *{pair}:* {price:.5f} {direction} ({change:.2f}%)\n"
+                    chart_buf = await self.generate_chart(signal.pair)
+                    await self.send_telegram_image(chart_buf, f"Entry chart for {signal.pair}")
                 except Exception as e:
-                    logger.error(f"Error getting {pair} data for report: {str(e)}")
+                    logger.error(f"Failed to generate or send chart: {e}")
+            
+            # Update active trades
+            await self.update_active_trades()
+            
+            # Update last check time
+            self.last_check_time = datetime.utcnow()
+            
+            # Generate performance report if we have closed trades
+            if self.historical_trades and len(self.historical_trades) % 5 == 0:  # Every 5 trades
+                await self.send_performance_report()
+                
+        except Exception as e:
+            logger.error(f"Error in scanner run: {str(e)}")
+
+    async def send_performance_report(self):
+        """Generate and send a performance report"""
+        if not self.historical_trades:
+            return
+        
+        try:
+            # Calculate statistics
+            total_trades = len(self.historical_trades)
+            winning_trades = sum(1 for t in self.historical_trades if t.profit > 0)
+            losing_trades = total_trades - winning_trades
+            total_profit = sum(t.profit for t in self.historical_trades)
+            win_rate = (winning_trades / total_trades * 100) if total_trades else 0
+            
+            # Generate report message
+            report = (
+                f"📊 *PERFORMANCE REPORT*\n"
+                f"Total Trades: *{total_trades}*\n"
+                f"Winning Trades: *{winning_trades}*\n"
+                f"Losing Trades: *{losing_trades}*\n"
+                f"Win Rate: *{win_rate:.2f}%*\n"
+                f"Total Profit: *${total_profit:.2f}*\n\n"
+                f"*Recent Trades:*\n"
+            )
+            
+            # Add recent trades info
+            for trade in sorted(self.historical_trades[-5:], key=lambda x: x.exit_time, reverse=True):
+                report += (
+                    f"• {trade.pair} {trade.type}: {trade.result} (${trade.profit:.2f})\n"
+                )
             
             # Send report
             await self.send_telegram_message(report)
-            logger.info("Daily report generated and sent")
             
+            # Generate equity curve
+            if len(self.historical_trades) >= 10:
+                plt.figure(figsize=(10, 6))
+                cumulative_profit = np.cumsum([t.profit for t in sorted(self.historical_trades, key=lambda x: x.exit_time)])
+                plt.plot(cumulative_profit)
+                plt.title('Equity Curve')
+                plt.xlabel('Trade Number')
+                plt.ylabel('Cumulative Profit ($)')
+                plt.grid(True)
+                
+                # Save to BytesIO
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png')
+                buf.seek(0)
+                plt.close()
+                
+                # Send chart
+                await self.send_telegram_image(buf, "Equity Curve")
+                
         except Exception as e:
-            logger.error(f"Error generating daily report: {str(e)}")
+            logger.error(f"Error generating performance report: {str(e)}")
 
-# Global variables
-forex_bot = None
-config = ForexBotConfig()
-
-# Function to validate credentials
-def authenticate(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = os.getenv("API_USERNAME", "admin")
-    correct_password = os.getenv("API_PASSWORD", "password")
-    
-    is_username_correct = secrets.compare_digest(credentials.username, correct_username)
-    is_password_correct = secrets.compare_digest(credentials.password, correct_password)
-    
-    if not (is_username_correct and is_password_correct):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Basic"},
+    async def start_scheduler(self):
+        """Start the background scheduler"""
+        # Add scanner job based on timeframe
+        if self.timeframe == 'H1':
+            self.scheduler.add_job(
+                self.run_scanner,
+                trigger=CronTrigger(minute=1),  # Run at 1 minute past every hour
+                id='scanner_job',
+                replace_existing=True
+            )
+        elif self.timeframe == 'H4':
+            self.scheduler.add_job(
+                self.run_scanner,
+                trigger=CronTrigger(hour='*/4', minute=1),  # Run every 4 hours
+                id='scanner_job',
+                replace_existing=True
+            )
+        else:
+            # Default to hourly
+            self.scheduler.add_job(
+                self.run_scanner,
+                trigger=CronTrigger(minute=1),  # Run at 1 minute past every hour
+                id='scanner_job',
+                replace_existing=True
+            )
+        
+        # Add daily report job
+        self.scheduler.add_job(
+            self.send_performance_report,
+            trigger=CronTrigger(hour=0, minute=1),  # Run daily at 00:01
+            id='daily_report',
+            replace_existing=True
         )
-    return credentials.username
+        
+        # Start the scheduler
+        self.scheduler.start()
+        logger.info(f"Scheduler started. Running scanner on {self.timeframe} timeframe.")
 
-# FastAPI startup event
-@app.on_event("startup")
-async def startup_event():
-    global forex_bot
-    
-    # Initialize the forex bot
-    forex_bot = OANDAForexBot(
-        api_key=os.getenv("OANDA_API_KEY"),
-        telegram_bot_token=os.getenv("TELEGRAM_TOKEN"),
-        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
-        pairs=config.pairs,
-        risk_amount=config.risk_amount,
-        min_risk_reward=config.min_risk_reward
-    )
-    
-    # Schedule market scanning tasks every 5 minutes
-    scheduler.add_job(
-        forex_bot.scan_market, 
-        'cron', 
-        minute='*/5',  # Run every 5 minutes
-        kwargs={"timeframe": config.timeframe}
-    )
-    
-    # Schedule daily report at 00:05 daily
-    scheduler.add_job(
-        forex_bot.generate_daily_report,
-        'cron',
-        hour='0',
-        minute='5'
-    )
-    
-    # Start the scheduler
-    scheduler.start()
-    logger.info("Forex Trading Bot initialized and scheduled tasks started")
-    
-    # Send startup notification
-    await forex_bot.send_telegram_message(
-        "*🤖 FOREX TRADING BOT STARTED*\n\n" +
-        f"Monitoring {len(config.pairs)} currency pairs\n" +
-        f"Timeframe: {config.timeframe}\n" +
-        "Bot will scan the market every 5 minutes and send signals when found."
-    )
-
-# FastAPI shutdown event
-@app.on_event("shutdown")
-async def shutdown_event():
-    # Stop the scheduler
-    scheduler.shutdown()
-    logger.info("Forex Trading Bot shutdown")
+# Create global bot instance
+bot = ForexTradingBot(
+    api_key=os.getenv("OANDA_API_KEY"),
+    telegram_token=os.getenv("TELEGRAM_TOKEN"),
+    telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
+    timeframe=os.getenv("TIMEFRAME", "H1")
+)
 
 # API routes
 @app.get("/")
 async def root():
-    return {"status": "online", "bot": "Forex Trading Signal Bot"}
-
-# Manually scan market and return signals
-@app.post("/scan", dependencies=[Depends(authenticate)])
-async def scan_market(background_tasks: BackgroundTasks):
-    """
-    Manually trigger a market scan for trading signals
-    """
-    # Run scan in background to not block the response
-    background_tasks.add_task(forex_bot.scan_market, config.timeframe)
-    return {"message": "Market scan initiated. Check Telegram for signals."}
-
-# Update bot configuration
-@app.post("/config", dependencies=[Depends(authenticate)])
-async def update_config(new_config: ForexBotConfig):
-    """
-    Update bot configuration
-    """
-    global config, forex_bot
-    
-    # Update global config
-    config = new_config
-    
-    # Update forex bot instance
-    if forex_bot:
-        forex_bot.pairs = config.pairs
-        forex_bot.risk_amount = config.risk_amount
-        forex_bot.min_risk_reward = config.min_risk_reward
-        
-        # Update Telegram settings if provided
-        if config.telegram.chat_id:
-            forex_bot.telegram_chat_id = config.telegram.chat_id
-    
-    # Restart scheduler with new settings
-    scheduler.remove_all_jobs()
-    
-    # Add scanning job every 5 minutes
-    scheduler.add_job(
-        forex_bot.scan_market, 
-        'cron', 
-        minute='*/5',  # Run every 5 minutes
-        kwargs={"timeframe": config.timeframe}
-    )
-    
-    # Add daily report job
-    scheduler.add_job(
-        forex_bot.generate_daily_report,
-        'cron',
-        hour='0',
-        minute='5'
-    )
-    
-    return {"message": "Configuration updated successfully", "config": config}
-
-# Get active signals
-@app.get("/signals", dependencies=[Depends(authenticate)])
-async def get_signals():
-    """
-    Get all active trading signals
-    """
-    if forex_bot:
-        return {"signals": forex_bot.active_signals}
-    return {"signals": []}
-
-# Get bot status and information
-@app.get("/status", dependencies=[Depends(authenticate)])
-async def get_status():
-    """
-    Get bot status information
-    """
-    if not forex_bot:
-        return {"status": "not_initialized"}
-    
-    # Construct status response
-    status_info = {
-        "status": "running",
-        "pairs_monitored": len(forex_bot.pairs),
-        "timeframe": config.timeframe,
-        "active_signals": len(forex_bot.active_signals),
-        "historical_signals": len(forex_bot.historical_signals),
-        "telegram_enabled": bool(forex_bot.telegram_bot and forex_bot.telegram_chat_id),
-        "uptime": "N/A"  # Could add uptime tracking
+    """Root endpoint"""
+    return {
+        "message": "Forex Trading Signal Bot is running",
+        "status": "active",
+        "timeframe": bot.timeframe,
+        "active_trades": len(bot.active_trades),
+        "historical_trades": len(bot.historical_trades)
     }
-    
-    return status_info
 
-# Send test notification
-@app.post("/test-notification", dependencies=[Depends(authenticate)])
-async def test_notification():
-    """
-    Send a test notification to Telegram
-    """
-    if not forex_bot:
-        raise HTTPException(status_code=400, detail="Bot not initialized")
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/trades/active")
+async def get_active_trades():
+    """Get all active trades"""
+    return [trade.dict() for trade in bot.active_trades.values()]
+
+@app.get("/trades/history")
+async def get_trade_history(limit: int = 20):
+    """Get historical trades with optional limit"""
+    return [trade.dict() for trade in sorted(
+        bot.historical_trades, 
+        key=lambda t: t.exit_time, 
+        reverse=True
+    )[:limit]]
+
+@app.get("/pairs")
+async def get_pairs():
+    """Get all monitored currency pairs"""
+    return {"pairs": bot.pairs}
+
+@app.post("/scan")
+async def trigger_scan(background_tasks: BackgroundTasks):
+    """Manually trigger a scan for signals"""
+    background_tasks.add_task(bot.run_scanner)
+    return {"message": "Scan triggered"}
+
+@app.post("/report")
+async def trigger_report(background_tasks: BackgroundTasks):
+    """Manually trigger a performance report"""
+    background_tasks.add_task(bot.send_performance_report)
+    return {"message": "Report generation triggered"}
+
+@app.get("/charts/{pair}")
+async def get_chart(pair: str):
+    """Generate and return a chart for a specific pair"""
+    if pair not in bot.pairs:
+        raise HTTPException(status_code=404, detail=f"Pair {pair} not found")
     
-    await forex_bot.send_telegram_message(
-        "*🧪 TEST NOTIFICATION*\n\n" +
-        "This is a test message to verify that your Telegram notifications are working correctly."
+    try:
+        # Generate the chart
+        chart_buf = await bot.generate_chart(pair)
+        
+        # Convert to base64 for API response
+        base64_chart = base64.b64encode(chart_buf.getvalue()).decode("utf-8")
+        
+        return {
+            "pair": pair,
+            "image": f"data:image/png;base64,{base64_chart}",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error generating chart for {pair}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate chart: {str(e)}")
+
+@app.get("/backtest")
+async def run_backtest(
+    pair: str,
+    start_date: str = None,
+    end_date: str = None,
+    timeframe: str = None
+):
+    """Run a backtest for a specific pair and time period"""
+    if pair not in bot.pairs:
+        raise HTTPException(status_code=404, detail=f"Pair {pair} not found")
+    
+    try:
+        # Parse dates
+        start = datetime.fromisoformat(start_date.replace('Z', '+00:00')) if start_date else None
+        end = datetime.fromisoformat(end_date.replace('Z', '+00:00')) if end_date else None
+        
+        # Fetch historical data
+        data = await bot.fetch_historical_data(
+            pair=pair,
+            timeframe=timeframe or bot.timeframe,
+            start_date=start,
+            end_date=end
+        )
+        
+        if data.empty:
+            return {"message": "No data available for the specified period"}
+        
+        # Calculate indicators
+        data = bot.calculate_indicators(data)
+        
+        # Run backtest
+        results = []
+        in_trade = False
+        current_trade = None
+        
+        for i in range(1, len(data) - 1):
+            # Check for entry if not in trade
+            if not in_trade:
+                # Create a slice for entry condition check
+                test_data = data.iloc[:i+2]
+                signal = bot.check_entry_conditions(test_data)
+                
+                if signal:
+                    in_trade = True
+                    current_trade = signal
+            
+            # Check for exit if in trade
+            elif in_trade:
+                # Create a slice for exit condition check
+                current_slice = data.iloc[i:i+1]
+                exit_result = bot.check_trade_exits(current_trade, current_slice)
+                
+                if exit_result:
+                    results.append(exit_result)
+                    in_trade = False
+                    current_trade = None
+        
+        # Calculate statistics
+        if results:
+            total_trades = len(results)
+            winning_trades = sum(1 for r in results if r.profit > 0)
+            total_profit = sum(r.profit for r in results)
+            win_rate = (winning_trades / total_trades) * 100 if total_trades else 0
+            
+            return {
+                "pair": pair,
+                "timeframe": timeframe or bot.timeframe,
+                "start_date": start.isoformat() if start else data.index[0].isoformat(),
+                "end_date": end.isoformat() if end else data.index[-1].isoformat(),
+                "total_trades": total_trades,
+                "winning_trades": winning_trades,
+                "losing_trades": total_trades - winning_trades,
+                "win_rate": f"{win_rate:.2f}%",
+                "total_profit": f"${total_profit:.2f}",
+                "results": [r.dict() for r in results]
+            }
+        else:
+            return {
+                "pair": pair,
+                "timeframe": timeframe or bot.timeframe,
+                "start_date": start.isoformat() if start else data.index[0].isoformat(),
+                "end_date": end.isoformat() if end else data.index[-1].isoformat(),
+                "message": "No trade signals generated during this period"
+            }
+            
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error running backtest for {pair}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to run backtest: {str(e)}")
+
+@app.post("/settings")
+async def update_settings(
+    risk_amount: Optional[float] = None,
+    min_risk_reward: Optional[float] = None,
+    daily_loss_limit: Optional[float] = None,
+    timeframe: Optional[str] = None,
+    pairs: Optional[List[str]] = None
+):
+    """Update bot settings"""
+    try:
+        if risk_amount is not None:
+            bot.risk_amount = risk_amount
+            
+        if min_risk_reward is not None:
+            bot.min_risk_reward = min_risk_reward
+            
+        if daily_loss_limit is not None:
+            bot.daily_loss_limit = daily_loss_limit
+            
+        if timeframe is not None:
+            bot.timeframe = timeframe
+            # We need to restart the scheduler with new timeframe
+            bot.scheduler.shutdown()
+            bot.scheduler = AsyncIOScheduler()
+            asyncio.create_task(bot.start_scheduler())
+            
+        if pairs is not None:
+            bot.pairs = pairs
+            
+        return {
+            "message": "Settings updated successfully",
+            "current_settings": {
+                "risk_amount": bot.risk_amount,
+                "min_risk_reward": bot.min_risk_reward,
+                "daily_loss_limit": bot.daily_loss_limit,
+                "timeframe": bot.timeframe,
+                "pairs": bot.pairs
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error updating settings: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to update settings: {str(e)}")
+
+@app.on_event("startup")
+async def startup_event():
+    """Run on application startup"""
+    logger.info("Starting Forex Trading Signal Bot")
+    
+    # Start the scheduler
+    await bot.start_scheduler()
+    
+    # Send startup notification
+    await bot.send_telegram_message(
+        "🚀 *Forex Trading Signal Bot Started*\n"
+        f"Monitoring {len(bot.pairs)} currency pairs on {bot.timeframe} timeframe"
     )
     
-    return {"message": "Test notification sent"}
+    # Perform initial scan
+    asyncio.create_task(bot.run_scanner())
 
-# Main entry point
-if __name__ == "__main__":
-    # Get port from environment variable for Railway compatibility
-    port = int(os.getenv("PORT", 8000))
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Run on application shutdown"""
+    logger.info("Shutting down Forex Trading Signal Bot")
     
-    # Run the FastAPI application
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    # Shutdown the scheduler
+    bot.scheduler.shutdown()
+    
+    # Send shutdown notification
+    try:
+        await bot.send_telegram_message("⚠️ *Forex Trading Signal Bot Stopped*")
+    except:
+        pass
+
+# Run the application
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
